@@ -165,17 +165,22 @@ class BunkrrCrawler(Crawler):
     @error_handling_wrapper
     async def _album_file(self, scrape_item: ScrapeItem, file: File, results: dict[str, int]) -> None:
         db_url = scrape_item.url.with_host(self.DATABASE_PRIMARY_HOST)
-        if await self.check_complete_from_referer(db_url):
-            return
-
-        deep_scrape = False
         scrape_item.possible_datetime = self.parse_date(file.date, "%H:%M:%S %d/%m/%Y")
         try:
             src = file.src()
         except ValueError:
-            deep_scrape = True
+            if await self.check_complete_from_referer(db_url):
+                return
+            self.create_task(self.run(scrape_item))
+            return
 
-        deep_scrape = deep_scrape or (
+        if self.check_album_results(src, results):
+            return
+
+        if await self.check_complete_from_referer(db_url):
+            return
+
+        deep_scrape = (
             src.suffix.lower() not in VIDEO_AND_IMAGE_EXTS
             or "no-image" in src.name
             or self.deep_scrape
@@ -183,9 +188,6 @@ class BunkrrCrawler(Crawler):
         )
         if deep_scrape:
             self.create_task(self.run(scrape_item))
-            return
-
-        if self.check_album_results(src, results):
             return
 
         await self._direct_file(scrape_item, src, file.name)
