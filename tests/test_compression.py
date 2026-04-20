@@ -290,6 +290,45 @@ def test_pynv_worker_prefers_full_file_mux_transcode(monkeypatch) -> None:
         assert pynv_worker_main([str(source), str(output), "0", '{"codec": "hevc"}']) == 0
         assert output.read_bytes() == b"compressed"
         assert "transcode_with_mux" in calls
+        assert f"decode:{output.name}:0:True" in calls
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_pynv_worker_rejects_outputs_that_cannot_be_decoded(monkeypatch) -> None:
+    root = _reset_test_dir()
+    try:
+        source = root / "input.mkv"
+        output = root / "output.mkv"
+        source.write_bytes(b"source")
+
+        class FakeDecoder:
+            def __init__(self, path: str, gpu_id: int = 0, use_device_memory: bool = False) -> None:
+                self.path = Path(path)
+
+            def get_stream_metadata(self) -> SimpleNamespace:
+                raise RuntimeError("FFmpegDemuxer::FFmpegDemuxer: invalid output")
+
+        class FakeTranscoder:
+            def __init__(
+                self,
+                enc_file_path: str,
+                muxed_file_path: str,
+                gpu_id: int,
+                cuda_context: int,
+                cuda_stream: int,
+                **kwargs: Any,
+            ) -> None:
+                self.output = Path(muxed_file_path)
+
+            def transcode_with_mux(self) -> None:
+                self.output.write_bytes(b"broken")
+
+        fake_pynv = SimpleNamespace(Transcoder=FakeTranscoder, SimpleDecoder=FakeDecoder)
+        monkeypatch.setitem(sys.modules, "PyNvVideoCodec", fake_pynv)
+
+        assert pynv_worker_main([str(source), str(output), "0", '{"codec": "hevc"}']) == 1
+        assert not output.exists()
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

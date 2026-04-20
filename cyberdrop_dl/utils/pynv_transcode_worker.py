@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import sys
@@ -52,6 +53,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         del transcoder
         gc.collect()
+
+    try:
+        actual_output = _resolve_output(output)
+        actual_output = _optimize_mp4_for_streaming(actual_output)
+        _retag_hevc_sample_entries(actual_output)
+        _validate_output(PyNvVideoCodec, str(actual_output), int(gpu_id))
+    except Exception as e:
+        _delete_outputs(output)
+        sys.stderr.write(f"{_format_exception(e, 'output')}\n")
+        return 1
+
     return 0
 
 
@@ -67,7 +79,11 @@ def _format_exception(error: Exception, stage: str = "input") -> str:
             "PyNvVideoCodec could not read this MP4 stream timing metadata "
             "(timescale not set). The original file was kept and compression was skipped."
         )
-    if "invalid data found when processing input" in normalized or "avformat_open_input" in normalized:
+    if (
+        "invalid data found when processing input" in normalized
+        or "avformat_open_input" in normalized
+        or (stage == "output" and "ffmpegdemuxer" in normalized)
+    ):
         if stage == "output":
             return "PyNvVideoCodec created an invalid output video at this CQ"
         return (
@@ -82,7 +98,8 @@ def _format_exception(error: Exception, stage: str = "input") -> str:
 def _delete_outputs(output: str) -> None:
     template = Path(output)
     for path in _candidate_outputs_for_cleanup(template):
-        path.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
 
 
 def _candidate_outputs(template: Path) -> list[Path]:
@@ -317,7 +334,7 @@ def _validate_output(pynv_module, output: str, gpu_id: int) -> None:
     try:
         decoder = pynv_module.SimpleDecoder(output, gpu_id=gpu_id, use_device_memory=True)
         metadata = decoder.get_stream_metadata()
-        duration = float(getattr(metadata, "duration", 0) or 0)
+        duration = float(getattr(metadata, "duration", 0) or getattr(metadata, "duration_in_seconds", 0) or 0)
         if duration <= 0:
             raise RuntimeError("PyNvVideoCodec output validation failed: zero duration")
         _ = decoder[0]
