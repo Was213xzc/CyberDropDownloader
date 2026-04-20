@@ -52,17 +52,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         del transcoder
         gc.collect()
-
-    try:
-        actual_output = _resolve_output(output)
-        _validate_output(PyNvVideoCodec, str(actual_output), int(gpu_id))
-        actual_output = _optimize_mp4_for_streaming(actual_output)
-        _retag_hevc_sample_entries(actual_output)
-        _validate_output(PyNvVideoCodec, str(actual_output), int(gpu_id))
-    except Exception as e:
-        _delete_outputs(output)
-        sys.stderr.write(f"{_format_exception(e, 'output')}\n")
-        return 1
     return 0
 
 

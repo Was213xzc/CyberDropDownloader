@@ -15,8 +15,7 @@ from cyberdrop_dl.config.config_model import CompressionOptions, ConfigSettings
 from cyberdrop_dl.managers.compression_manager import (
     CompressionManager,
     CompressionResult,
-    _format_process_failure,
-    _sanitize_process_output,
+    _format_pynv_exception,
 )
 from cyberdrop_dl.utils import yaml
 from cyberdrop_dl.utils.pynv_transcode_worker import (
@@ -87,7 +86,7 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert options.compress_videos is True
         assert options.compress_images is True
         assert options.video_backend == "pynv"
-        assert options.ffmpeg_nvenc_fallback is True
+        assert options.ffmpeg_nvenc_fallback is False
         assert options.video_codec == "hevc"
         assert options.video_workers_per_gpu == 2
         assert options.hevc_cq == 23
@@ -107,7 +106,7 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         serialized_config = yaml.load(config_file)
         assert serialized_config["compression_options"]["video_codec"] == "hevc"
         assert serialized_config["compression_options"]["video_workers_per_gpu"] == 2
-        assert serialized_config["compression_options"]["ffmpeg_nvenc_fallback"] is True
+        assert serialized_config["compression_options"]["ffmpeg_nvenc_fallback"] is False
         assert serialized_config["compression_options"]["image_min_savings_percent"] == 0
         assert serialized_config["compression_options"]["video_cq_retry_step"] == 4
         assert serialized_config["compression_options"]["video_cq_max"] == 35
@@ -136,58 +135,6 @@ def test_video_compression_skips_when_pynv_is_unavailable() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_video_compression_falls_back_to_ffmpeg_nvenc_after_pynv_failure() -> None:
-    root = _reset_test_dir()
-    try:
-        video = root / "video.mp4"
-        video.write_bytes(b"x" * 100)
-        owner = FakeCompressionOwner()
-        compression_manager = CompressionManager(cast("Any", owner))
-        calls: list[str] = []
-
-        async def fake_probe(source: Path) -> SimpleNamespace:
-            return SimpleNamespace(video=SimpleNamespace(codec="h264"))
-
-        async def fail_pynv(source: Path, output: Path, gpu_id: int, codec: str, cq: int) -> None:
-            calls.append(f"pynv:{gpu_id}:{codec}:{cq}")
-            raise RuntimeError("pynv crashed")
-
-        async def has_encoder(encoder: str) -> bool:
-            calls.append(f"encoder:{encoder}")
-            return True
-
-        async def transcode_ffmpeg(source: Path, output: Path, gpu_id: int, codec: str, cq: int) -> None:
-            calls.append(f"ffmpeg:{gpu_id}:{codec}:{cq}")
-            await asyncio.to_thread(output.write_bytes, b"y" * 50)
-
-        async def validate_video(path: Path) -> None:
-            calls.append(f"validate:{path.name}")
-
-        compression_manager._probe_if_available = fake_probe
-        compression_manager._import_pynv = lambda: object()
-        compression_manager._transcode_with_pynv_subprocess = fail_pynv
-        compression_manager._ffmpeg_has_encoder = has_encoder
-        compression_manager._transcode_with_ffmpeg_nvenc = transcode_ffmpeg
-        compression_manager._validate_video = validate_video
-
-        result = asyncio.run(compression_manager.compress_media_item(_media_item(video)))
-
-        assert result is not None
-        assert result.status == "compressed"
-        assert result.backend == "ffmpeg_nvenc"
-        assert video.read_bytes() == b"y" * 50
-        assert calls == [
-            "pynv:0:hevc:23",
-            "encoder:hevc_nvenc",
-            "ffmpeg:0:hevc:23",
-            "validate:video.compressed.mp4",
-        ]
-        assert owner.progress_manager.results == [("compressed", 50)]
-        assert owner.log_manager.rows[0]["backend"] == "ffmpeg_nvenc"
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
-
-
 def test_pynv_retries_higher_cq_when_output_is_too_large() -> None:
     root = _reset_test_dir()
     try:
@@ -197,22 +144,14 @@ def test_pynv_retries_higher_cq_when_output_is_too_large() -> None:
         compression_manager = CompressionManager(cast("Any", owner))
         calls: list[int] = []
 
-        async def fake_probe(source: Path) -> SimpleNamespace:
-            return SimpleNamespace(video=SimpleNamespace(codec="h264"))
-
         async def transcode_pynv(source: Path, output: Path, gpu_id: int, codec: str, cq: int) -> None:
             calls.append(cq)
             if cq == 23:
                 raise RuntimeError("PyNvVideoCodec output exceeded safe size limit")
             await asyncio.to_thread(output.write_bytes, b"y" * 50)
 
-        async def validate_video(path: Path) -> None:
-            return None
-
-        compression_manager._probe_if_available = fake_probe
         compression_manager._import_pynv = lambda: object()
         compression_manager._transcode_with_pynv_subprocess = transcode_pynv
-        compression_manager._validate_video = validate_video
 
         result = asyncio.run(compression_manager.compress_media_item(_media_item(video)))
 
@@ -234,19 +173,22 @@ Traceback (most recent call last):
 _PyNvVideoCodec.PyNvVCException: FFmpegDemuxer::CreateFormatContext :
 Error code : -1094995529
 Error Type : avformat_open_input(&ctx, szFilePath, NULL, NULL) returned error " Invalid data found when processing input"
-"""
+    """
     compression_manager = CompressionManager(cast("Any", FakeCompressionOwner()))
 
+    assert _format_pynv_exception(RuntimeError("Invalid data found when processing input")) == (
+        "PyNvVideoCodec could not open the input video. "
+        "The file is unsupported, corrupted, incomplete, or not a real video container."
+    )
+    assert _format_pynv_exception(RuntimeError("Invalid data found when processing input"), "output") == (
+        "PyNvVideoCodec created an invalid output video at this CQ"
+    )
     assert _format_exception(RuntimeError("Invalid data found when processing input")) == (
         "PyNvVideoCodec could not open the input video. "
         "The file is unsupported, corrupted, incomplete, or not a real video container."
     )
     assert _format_exception(RuntimeError("Invalid data found when processing input"), "output") == (
         "PyNvVideoCodec created an invalid output video at this CQ"
-    )
-    assert _sanitize_process_output(traceback_output) == (
-        "PyNvVideoCodec could not open the input video. "
-        "The file is unsupported, corrupted, incomplete, or not a real video container."
     )
     assert compression_manager._should_retry_with_higher_cq(traceback_output, 23) is False
     assert compression_manager._should_retry_with_higher_cq(
@@ -255,17 +197,12 @@ Error Type : avformat_open_input(&ctx, szFilePath, NULL, NULL) returned error " 
     )
 
     timescale_output = "[mov,mp4,m4a,3gp,3g2,mj2 @ 000001C6C0394040] stream 0, timescale not set"
+    assert _format_pynv_exception(RuntimeError(timescale_output)) == (
+        "PyNvVideoCodec could not read this MP4 stream timing metadata"
+    )
     assert _format_exception(RuntimeError(timescale_output)) == (
         "PyNvVideoCodec could not read this MP4 stream timing metadata "
         "(timescale not set). The original file was kept and compression was skipped."
-    )
-    assert _format_process_failure("PyNvVideoCodec", 3221225477, timescale_output) == (
-        "PyNvVideoCodec could not read this MP4 stream timing metadata "
-        "(timescale not set). The original file was kept and compression was skipped."
-    )
-    assert _format_process_failure("PyNvVideoCodec", 3221225477, "") == (
-        "PyNvVideoCodec worker crashed while opening or processing this video. "
-        "The original file was kept and compression was skipped."
     )
 
 
@@ -288,30 +225,6 @@ def test_pynv_encoder_kwargs_use_gpu_buffers_constqp_and_b_frames() -> None:
     assert hevc_kwargs["preset"] == "P6"
     assert hevc_kwargs["tuning_info"] == "high_quality"
     assert "gpu_id" not in hevc_kwargs
-
-
-def test_ffmpeg_nvenc_command_uses_cuda_constqp_audio_copy_and_faststart(monkeypatch) -> None:
-    monkeypatch.setattr("cyberdrop_dl.managers.compression_manager.ffmpeg.which_ffmpeg", lambda: "ffmpeg")
-    compression_manager = CompressionManager(cast("Any", FakeCompressionOwner()))
-
-    command = compression_manager._ffmpeg_nvenc_command(
-        Path("input.mp4"),
-        Path("input.compressed.mp4"),
-        1,
-        "hevc",
-        23,
-    )
-
-    assert command[:2] == ("ffmpeg", "-y")
-    assert ("-hwaccel", "cuda") == command[6:8]
-    assert ("-hwaccel_device", "1") == command[8:10]
-    assert "hevc_nvenc" in command
-    assert ("-rc", "constqp") == command[command.index("-rc") : command.index("-rc") + 2]
-    assert ("-qp", "23") == command[command.index("-qp") : command.index("-qp") + 2]
-    assert ("-bf", "3") == command[command.index("-bf") : command.index("-bf") + 2]
-    assert ("-c:a", "copy") == command[command.index("-c:a") : command.index("-c:a") + 2]
-    assert ("-movflags", "+faststart") == command[command.index("-movflags") : command.index("-movflags") + 2]
-    assert ("-tag:v", "hvc1") == command[command.index("-tag:v") : command.index("-tag:v") + 2]
 
 
 def test_pynv_worker_stringifies_config_and_resolves_segment_output() -> None:
@@ -521,29 +434,6 @@ def test_video_slots_allow_at_most_two_jobs_per_gpu() -> None:
     asyncio.run(run_all_jobs())
 
     assert peak_by_gpu == {0: 2, 1: 2}
-
-
-def test_video_temp_output_size_guard_stops_expanding_outputs() -> None:
-    root = _reset_test_dir()
-    try:
-        source = root / "video.mov"
-        temp_output = root / "video.compressed.mov"
-        timestamped_output = root / "video.compressed_0.000000_101.031670.mov"
-        faststart_output = timestamped_output.with_suffix(timestamped_output.suffix + ".faststart")
-        source.write_bytes(b"x" * 100)
-        temp_output.write_bytes(b"x" * 50)
-        timestamped_output.write_bytes(b"x" * 96)
-        faststart_output.write_bytes(b"x" * 120)
-
-        compression_manager = CompressionManager(cast("Any", FakeCompressionOwner(CompressionOptions())))
-
-        assert compression_manager._max_acceptable_output_size(source) == 95
-        assert compression_manager._get_oversized_temp_output(temp_output, 95) == (timestamped_output.name, 96)
-
-        timestamped_output.write_bytes(b"x" * 80)
-        assert compression_manager._get_oversized_temp_output(temp_output, 95) == (faststart_output.name, 120)
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_resolve_pynv_timestamped_segment_output() -> None:

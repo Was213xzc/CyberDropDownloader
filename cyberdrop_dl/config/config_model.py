@@ -291,7 +291,7 @@ class CompressionOptions(BaseModel):
     compress_videos: bool = True
     compress_images: bool = True
     video_backend: NonEmptyStr = "pynv"
-    ffmpeg_nvenc_fallback: bool = True
+    ffmpeg_nvenc_fallback: bool = False
     video_codec: NonEmptyStr = "hevc"
     gpu_ids: list[NonNegativeInt] = [0]
     video_workers_per_gpu: PositiveInt = Field(2, le=2)
