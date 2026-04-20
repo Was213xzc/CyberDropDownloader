@@ -328,6 +328,7 @@ class DownloadClient:
                     await self.mark_incomplete(media_item, domain)
                     self.manager.progress_manager.download_progress.add_skipped()
                     return False
+                await self.manager.compression_manager.compress_media_item(media_item)
                 await self.process_completed(media_item, domain)
                 await self.handle_media_item_completion(media_item, downloaded=True)
         return downloaded

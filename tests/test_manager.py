@@ -145,6 +145,7 @@ def test_skipped_duplicate_urls_log_is_urls_txt() -> None:
         download_error_urls_log=log_folder / "Download_Error_URLs.csv",
         scrape_error_urls_log=log_folder / "Scrape_Error_URLs.csv",
         skipped_duplicate_urls_log=log_folder / "Skipped_Duplicate_URLs.txt",
+        compression_report_log=log_folder / "Compression_Report.csv",
     )
     log_manager = LogManager(SimpleNamespace(path_manager=path_manager))
     url = AbsoluteHttpURL("https://example.com/file-page")

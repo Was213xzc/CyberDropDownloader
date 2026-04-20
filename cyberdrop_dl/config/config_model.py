@@ -286,8 +286,48 @@ class DupeCleanup(BaseModel):
     send_deleted_to_trash: bool = True
 
 
+class CompressionOptions(BaseModel):
+    enabled: bool = True
+    compress_videos: bool = True
+    compress_images: bool = True
+    video_backend: NonEmptyStr = "pynv"
+    video_codec: NonEmptyStr = "hevc"
+    gpu_ids: list[NonNegativeInt] = [0]
+    video_workers_per_gpu: PositiveInt = Field(2, le=2)
+    hevc_cq: NonNegativeInt = 23
+    av1_cq: NonNegativeInt = 26
+    bf: NonNegativeInt = 3
+    preset: NonEmptyStr = "P6"
+    tuning_info: NonEmptyStr = "high_quality"
+    min_savings_percent: NonNegativeInt = 5
+    jpeg_quality: PositiveInt = Field(85, le=95)
+    webp_quality: PositiveInt = Field(80, le=100)
+    png_optimize: bool = True
+
+    @field_validator("video_backend", mode="after")
+    @classmethod
+    def validate_video_backend(cls, value: str) -> str:
+        if value.casefold() != "pynv":
+            raise ValueError("only 'pynv' is supported")
+        return value.casefold()
+
+    @field_validator("video_codec", mode="after")
+    @classmethod
+    def validate_video_codec(cls, value: str) -> str:
+        codec = value.casefold()
+        if codec not in {"hevc", "av1"}:
+            raise ValueError("video_codec must be 'hevc' or 'av1'")
+        return codec
+
+    @field_validator("video_workers_per_gpu", mode="before")
+    @classmethod
+    def clamp_video_workers_per_gpu(cls, value: int | str) -> int:
+        return min(max(int(value), 1), 2)
+
+
 class ConfigSettings(ConfigModel):
     browser_cookies: BrowserCookies = Field(BrowserCookies(), "Browser_Cookies")
+    compression_options: CompressionOptions = Field(CompressionOptions(), "Compression_Options")
     download_options: DownloadOptions = Field(DownloadOptions(), "Download_Options")
     dupe_cleanup_options: DupeCleanup = Field(DupeCleanup(), "Dupe_Cleanup_Options")
     file_size_limits: FileSizeLimits = Field(FileSizeLimits(), "File_Size_Limits")

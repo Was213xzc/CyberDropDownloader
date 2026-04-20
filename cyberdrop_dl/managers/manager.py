@@ -13,6 +13,7 @@ from cyberdrop_dl.database import Database
 from cyberdrop_dl.database.transfer import transfer_v5_db_to_v6
 from cyberdrop_dl.managers.cache_manager import CacheManager
 from cyberdrop_dl.managers.client_manager import ClientManager
+from cyberdrop_dl.managers.compression_manager import CompressionManager
 from cyberdrop_dl.managers.config_manager import ConfigManager
 from cyberdrop_dl.managers.hash_manager import HashManager
 from cyberdrop_dl.managers.live_manager import LiveManager
@@ -52,6 +53,7 @@ class Manager:
         self.db_manager: Database = field(init=False)
         self.client_manager: ClientManager = field(init=False)
         self.storage_manager: StorageManager = field(init=False)
+        self.compression_manager: CompressionManager = field(init=False)
 
         self.progress_manager: ProgressManager = field(init=False)
         self.live_manager: LiveManager = field(init=False)
@@ -158,6 +160,8 @@ class Manager:
         if not isinstance(self.progress_manager, ProgressManager):
             self.progress_manager = ProgressManager(self)
             self.progress_manager.startup()
+        if not isinstance(self.compression_manager, CompressionManager):
+            self.compression_manager = CompressionManager(self)
 
     def process_additive_args(self) -> None:
         cli_general_options = self.parsed_args.global_settings.general
@@ -218,6 +222,7 @@ class Manager:
         "Partial shutdown for managers used for hash directory scanner"
         self.db_manager = await close_if_defined(self.db_manager)
         self.hash_manager = constants.NOT_DEFINED
+        self.compression_manager = constants.NOT_DEFINED
         self.progress_manager.hash_progress.reset()
 
     async def close(self) -> None:

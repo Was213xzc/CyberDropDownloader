@@ -55,6 +55,11 @@ class ProgressManager:
         self.hash_progress = HashProgress(manager)
         self.sort_progress = SortProgress(1, manager)
 
+        self.compression_compressed_files = 0
+        self.compression_skipped_files = 0
+        self.compression_failed_files = 0
+        self.compression_bytes_saved = 0
+
         self.ui_refresh_rate = ui_options.refresh_rate
 
         self.hash_remove_layout: RenderableType = field(init=False)
@@ -171,6 +176,7 @@ class ProgressManager:
         log_yellow(f"  Skipped: {self.scrape_stats_progress.unsupported_urls_skipped:,}")
 
         self.print_dedupe_stats()
+        self.print_compression_stats()
 
         log_spacer(20, "")
         log_cyan("Sort Stats:")
@@ -188,6 +194,27 @@ class ProgressManager:
         log_yellow(f"  Newly Hashed: {self.hash_progress.hashed_files:,} files")
         log_yellow(f"  Previously Hashed: {self.hash_progress.prev_hashed_files:,} files")
         log_yellow(f"  Removed (Downloads): {self.hash_progress.removed_files:,} files")
+
+    def add_compression_result(self, status: str, bytes_saved: int = 0) -> None:
+        if status == "compressed":
+            self.compression_compressed_files += 1
+            self.compression_bytes_saved += bytes_saved
+        elif status == "failed":
+            self.compression_failed_files += 1
+        else:
+            self.compression_skipped_files += 1
+
+    def print_compression_stats(self) -> None:
+        if not self.manager.config.compression_options.enabled:
+            return
+
+        bytes_saved = ByteSize(self.compression_bytes_saved).human_readable(decimal=True)
+        log_spacer(20, "")
+        log_cyan("Compression Stats:")
+        log_green(f"  Compressed: {self.compression_compressed_files:,} files")
+        log_yellow(f"  Skipped: {self.compression_skipped_files:,} files")
+        log_red(f"  Failed: {self.compression_failed_files:,} files")
+        log_green(f"  Total Bytes Saved: {bytes_saved}")
 
 
 def log_failures(failures: list[UiFailureTotal], title: str = "Failures:", last_padding: int = 0) -> int:

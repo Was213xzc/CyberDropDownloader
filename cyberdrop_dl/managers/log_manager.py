@@ -29,6 +29,7 @@ class LogManager:
         self.download_error_log: Path = manager.path_manager.download_error_urls_log
         self.scrape_error_log: Path = manager.path_manager.scrape_error_urls_log
         self.skipped_duplicate_urls_log: Path = manager.path_manager.skipped_duplicate_urls_log
+        self.compression_report_log: Path = manager.path_manager.compression_report_log
         self.jsonl_file = self.main_log.with_suffix(".results.jsonl")
         self._file_locks: dict[Path, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._has_headers: set[Path] = set()
@@ -96,6 +97,10 @@ class LogManager:
         self.manager.task_group.create_task(
             self._write_to_urls_txt(self.skipped_duplicate_urls_log, media_item.referer or media_item.url)
         )
+
+    async def write_compression_report(self, **kwargs) -> None:
+        """Writes a row to the compression report CSV."""
+        await self._write_to_csv(self.compression_report_log, **kwargs)
 
     def write_scrape_error_log(self, url: URL | str, error_message: str, origin: URL | Path | None = None) -> None:
         """Writes to the scrape error log."""
