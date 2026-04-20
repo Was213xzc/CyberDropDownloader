@@ -344,7 +344,59 @@ def test_image_compression_preserves_extension_and_replaces_only_when_smaller() 
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_download_lifecycle_compresses_after_rename_before_history_and_hash() -> None:
+def test_compression_queue_processes_completed_downloads_fifo() -> None:
+    async def run_queue() -> list[str]:
+        owner = FakeCompressionOwner()
+        compression_manager = CompressionManager(cast("Any", owner))
+        order: list[str] = []
+        media_items = [
+            cast("MediaItem", SimpleNamespace(complete_file=Path("one.jpg"), filename="one.jpg", is_segment=False)),
+            cast("MediaItem", SimpleNamespace(complete_file=Path("two.jpg"), filename="two.jpg", is_segment=False)),
+        ]
+
+        async def fake_compress(media_item: MediaItem) -> None:
+            order.append(f"compress:{media_item.filename}")
+
+        async def fake_process(media_item: MediaItem, domain: str) -> None:
+            order.append(f"process:{domain}:{media_item.filename}")
+
+        async def fake_handle(media_item: MediaItem, downloaded: bool = False) -> None:
+            order.append(f"handle:{downloaded}:{media_item.filename}")
+
+        async def fake_finalize(media_item: MediaItem, downloaded: bool) -> None:
+            order.append(f"finalize:{downloaded}:{media_item.filename}")
+
+        completion_lock = asyncio.Lock()
+        await completion_lock.acquire()
+        compression_manager.compress_media_item = fake_compress
+        for index, media_item in enumerate(media_items):
+            await compression_manager.enqueue_completed_download(
+                "example.com",
+                media_item,
+                fake_process,
+                fake_handle,
+                finalize_download=fake_finalize,
+                completion_lock=completion_lock if index == 0 else None,
+            )
+
+        await compression_manager.join()
+        assert not completion_lock.locked()
+        await compression_manager.close()
+        return order
+
+    assert asyncio.run(run_queue()) == [
+        "compress:one.jpg",
+        "process:example.com:one.jpg",
+        "handle:True:one.jpg",
+        "finalize:True:one.jpg",
+        "compress:two.jpg",
+        "process:example.com:two.jpg",
+        "handle:True:two.jpg",
+        "finalize:True:two.jpg",
+    ]
+
+
+def test_download_lifecycle_enqueues_after_rename_and_duration_check() -> None:
     root = _reset_test_dir()
     try:
         partial_file = root / "download.jpg.part"
@@ -371,8 +423,24 @@ def test_download_lifecycle_compresses_after_rename_before_history_and_hash() ->
                 return True
 
         class FakeCompressionManager:
-            async def compress_media_item(self, media_item: MediaItem) -> None:
-                order.append("compress")
+            async def enqueue_completed_download(
+                self,
+                domain: str,
+                media_item: MediaItem,
+                process_completed: Any,
+                handle_completion: Any,
+                *,
+                downloaded: bool = True,
+                finalize_download: Any = None,
+                completion_lock: asyncio.Lock | None = None,
+            ) -> None:
+                order.append("enqueue")
+                assert domain == "example.com"
+                assert downloaded is True
+                assert process_completed == client.process_completed
+                assert handle_completion == client.handle_media_item_completion
+                assert finalize_download is None
+                assert completion_lock is None
                 assert media_item.complete_file.read_text(encoding="utf8") == "downloaded"
 
         running = asyncio.Event()
@@ -416,9 +484,7 @@ def test_download_lifecycle_compresses_after_rename_before_history_and_hash() ->
             "download",
             "duration",
             "add_duration",
-            "compress",
-            "process_completed",
-            "handle_completion",
+            "enqueue",
         ]
     finally:
         shutil.rmtree(root, ignore_errors=True)

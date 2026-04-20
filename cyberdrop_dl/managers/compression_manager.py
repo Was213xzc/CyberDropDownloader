@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gc
 import importlib
 import json
@@ -15,6 +16,7 @@ from cyberdrop_dl.utils import ffmpeg
 from cyberdrop_dl.utils.logger import log
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
     from types import ModuleType
 
@@ -25,6 +27,17 @@ if TYPE_CHECKING:
 
 CompressionStatus = Literal["compressed", "skipped", "failed"]
 MediaType = Literal["video", "image"]
+
+
+@dataclass(slots=True, kw_only=True)
+class CompressionQueueItem:
+    domain: str
+    media_item: MediaItem
+    process_completed: Callable[[MediaItem, str], Awaitable[None]]
+    handle_completion: Callable[[MediaItem, bool], Awaitable[None]]
+    downloaded: bool = True
+    finalize_download: Callable[[MediaItem, bool], Awaitable[None]] | None = None
+    completion_lock: asyncio.Lock | None = None
 
 
 @dataclass(slots=True, kw_only=True)
@@ -59,11 +72,84 @@ class CompressionManager:
         self.manager = manager
         self._gpu_index = 0
         self._pynv_unavailable_logged = False
+        self._queue: asyncio.Queue[CompressionQueueItem | None] = asyncio.Queue()
+        self._queue_task: asyncio.Task[None] | None = None
         self._video_semaphores: defaultdict[int, asyncio.BoundedSemaphore] = defaultdict(self._make_video_semaphore)
 
     @property
     def options(self) -> CompressionOptions:
         return self.manager.config.compression_options
+
+    def startup(self) -> None:
+        if self._queue_task is None or self._queue_task.done():
+            self._queue_task = asyncio.create_task(self._run_queue(), name="cyberdrop-compression-queue")
+
+    async def close(self) -> None:
+        await self.join()
+        if self._queue_task is None:
+            return
+
+        await self._queue.put(None)
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._queue_task
+        self._queue_task = None
+
+    async def join(self) -> None:
+        if self._queue_task is None:
+            return
+        await self._queue.join()
+
+    async def enqueue_completed_download(
+        self,
+        domain: str,
+        media_item: MediaItem,
+        process_completed: Callable[[MediaItem, str], Awaitable[None]],
+        handle_completion: Callable[[MediaItem, bool], Awaitable[None]],
+        *,
+        downloaded: bool = True,
+        finalize_download: Callable[[MediaItem, bool], Awaitable[None]] | None = None,
+        completion_lock: asyncio.Lock | None = None,
+    ) -> None:
+        self.startup()
+        await self._queue.put(
+            CompressionQueueItem(
+                domain=domain,
+                media_item=media_item,
+                process_completed=process_completed,
+                handle_completion=handle_completion,
+                downloaded=downloaded,
+                finalize_download=finalize_download,
+                completion_lock=completion_lock,
+            )
+        )
+
+    async def _run_queue(self) -> None:
+        while True:
+            item = await self._queue.get()
+            try:
+                if item is None:
+                    return
+                await self._process_queue_item(item)
+            finally:
+                self._queue.task_done()
+
+    async def _process_queue_item(self, item: CompressionQueueItem) -> None:
+        try:
+            try:
+                await self.compress_media_item(item.media_item)
+            except Exception as e:
+                log(f"Compression queue failed for {item.media_item.complete_file}: {e}", 40, exc_info=True)
+
+            try:
+                await item.process_completed(item.media_item, item.domain)
+                await item.handle_completion(item.media_item, downloaded=item.downloaded)
+                if item.finalize_download is not None:
+                    await item.finalize_download(item.media_item, downloaded=item.downloaded)
+            except Exception as e:
+                log(f"Post-download completion failed for {item.media_item.complete_file}: {e}", 40, exc_info=True)
+        finally:
+            if item.completion_lock is not None and item.completion_lock.locked():
+                item.completion_lock.release()
 
     async def compress_media_item(self, media_item: MediaItem) -> CompressionResult | None:
         options = self.options

@@ -200,9 +200,23 @@ class Downloader:
             raise DownloadError("FFmpeg Error", msg, media_item) from None
 
         async with self._download_context(media_item):
-            await self._start_hls_download(media_item, m3u8_group)
+            lock = self._file_lock_vault[media_item.filename]
+            await lock.acquire()
+            release_lock = True
+            try:
+                await self._start_hls_download(media_item, m3u8_group, completion_lock=lock)
+                release_lock = False
+            finally:
+                if release_lock and lock.locked():
+                    lock.release()
 
-    async def _start_hls_download(self, media_item: MediaItem, m3u8_group: RenditionGroup) -> None:
+    async def _start_hls_download(
+        self,
+        media_item: MediaItem,
+        m3u8_group: RenditionGroup,
+        *,
+        completion_lock: asyncio.Lock | None = None,
+    ) -> None:
         media_item.complete_file = media_item.download_folder / media_item.filename
         # TODO: register database duration from m3u8 info
         # TODO: compute approx size for UI from the m3u8 info
@@ -222,9 +236,14 @@ class Downloader:
             if not ffmpeg_result.success:
                 raise DownloadError("FFmpeg Concat Error", ffmpeg_result.stderr, media_item)
 
-        await self.client.process_completed(media_item, self.domain)
-        await self.client.handle_media_item_completion(media_item, downloaded=True)
-        await self.finalize_download(media_item, downloaded=True)
+        await self.manager.compression_manager.enqueue_completed_download(
+            self.domain,
+            media_item,
+            self.client.process_completed,
+            self.client.handle_media_item_completion,
+            finalize_download=self.finalize_download,
+            completion_lock=completion_lock,
+        )
 
     async def _download_rendition_group(
         self, media_item: MediaItem, m3u8_group: RenditionGroup
@@ -425,16 +444,25 @@ class Downloader:
         if not media_item.is_segment:
             log(f"{self.log_prefix} starting: {media_item.url}", 20)
 
-        async with self._file_lock_vault[media_item.filename]:
+        lock = self._file_lock_vault[media_item.filename]
+        await lock.acquire()
+        release_lock = True
+        try:
             log_debug(f"Lock for {media_item.filename} acquired", 20)
-            try:
-                return bool(await self.download(media_item))
-            finally:
+            downloaded = bool(await self.download(media_item, completion_lock=lock))
+            if downloaded and not media_item.is_segment:
+                release_lock = False
+            return downloaded
+        finally:
+            if release_lock and lock.locked():
+                lock.release()
                 log_debug(f"Lock for {media_item.filename} released", 20)
+            elif not release_lock:
+                log_debug(f"Lock for {media_item.filename} transferred to completion queue", 20)
 
     @error_handling_wrapper
     @retry
-    async def download(self, media_item: MediaItem) -> bool | None:
+    async def download(self, media_item: MediaItem, completion_lock: asyncio.Lock | None = None) -> bool | None:
         """Downloads the media item."""
         url_as_str = str(media_item.url)
         if url_as_str in KNOWN_BAD_URLS:
@@ -446,13 +474,12 @@ class Downloader:
             if not media_item.is_segment:
                 media_item.duration = await self.manager.db_manager.history_table.get_duration(self.domain, media_item)
                 await self.check_file_can_download(media_item)
-            downloaded = await self.client.download_file(self.domain, media_item)
-            if downloaded:
-                await asyncio.to_thread(Path.chmod, media_item.complete_file, 0o666)
-                if not media_item.is_segment:
-                    await self.set_file_datetime(media_item, media_item.complete_file)
-                    self.manager.progress_manager.download_progress.add_completed()
-                    log(f"Download finished: {media_item.url}", 20)
+            downloaded = await self.client.download_file(
+                self.domain,
+                media_item,
+                self.finalize_download,
+                completion_lock=completion_lock,
+            )
             self.attempt_task_removal(media_item)
             return downloaded
 

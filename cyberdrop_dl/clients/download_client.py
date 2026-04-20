@@ -305,7 +305,13 @@ class DownloadClient:
 
         return check_download_speed
 
-    async def download_file(self, domain: str, media_item: MediaItem) -> bool:
+    async def download_file(
+        self,
+        domain: str,
+        media_item: MediaItem,
+        finalize_download: Callable[[MediaItem, bool], Coroutine[Any, Any, None]] | None = None,
+        completion_lock: asyncio.Lock | None = None,
+    ) -> bool:
         """Starts a file."""
         if self.manager.config.download_options.skip_download_mark_completed and not media_item.is_segment:
             log(f"Download Removed {media_item.url} due to mark completed option", 10)
@@ -328,9 +334,14 @@ class DownloadClient:
                     await self.mark_incomplete(media_item, domain)
                     self.manager.progress_manager.download_progress.add_skipped()
                     return False
-                await self.manager.compression_manager.compress_media_item(media_item)
-                await self.process_completed(media_item, domain)
-                await self.handle_media_item_completion(media_item, downloaded=True)
+                await self.manager.compression_manager.enqueue_completed_download(
+                    domain,
+                    media_item,
+                    self.process_completed,
+                    self.handle_media_item_completion,
+                    finalize_download=finalize_download,
+                    completion_lock=completion_lock,
+                )
         return downloaded
 
     """~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"""

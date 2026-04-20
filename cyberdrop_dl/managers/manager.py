@@ -162,6 +162,7 @@ class Manager:
             self.progress_manager.startup()
         if not isinstance(self.compression_manager, CompressionManager):
             self.compression_manager = CompressionManager(self)
+        self.compression_manager.startup()
 
     def process_additive_args(self) -> None:
         cli_general_options = self.parsed_args.global_settings.general
@@ -220,16 +221,15 @@ class Manager:
 
     async def async_db_close(self) -> None:
         "Partial shutdown for managers used for hash directory scanner"
+        self.compression_manager = await close_if_defined(self.compression_manager)
         self.db_manager = await close_if_defined(self.db_manager)
         self.hash_manager = constants.NOT_DEFINED
-        self.compression_manager = constants.NOT_DEFINED
         self.progress_manager.hash_progress.reset()
 
     async def close(self) -> None:
         """Closes the manager."""
-        self.states.RUNNING.clear()
-
         await self.async_db_close()
+        self.states.RUNNING.clear()
 
         self.client_manager = await close_if_defined(self.client_manager)
         self.storage_manager = await close_if_defined(self.storage_manager)
