@@ -496,10 +496,22 @@ class CompressionManager:
                 await asyncio.sleep(0.25)
 
     def _delete_temp_outputs(self, temp_output: Path) -> None:
-        temp_output.unlink(missing_ok=True)
-        for path in temp_output.parent.glob(f"{temp_output.stem}*{temp_output.suffix}"):
-            if path != temp_output:
-                path.unlink(missing_ok=True)
+        for path in self._temp_output_cleanup_candidates(temp_output):
+            path.unlink(missing_ok=True)
+
+    def _temp_output_cleanup_candidates(self, temp_output: Path) -> list[Path]:
+        candidates = []
+        seen: set[Path] = set()
+        timestamped_outputs = [temp_output]
+        timestamped_outputs.extend(
+            path for path in temp_output.parent.glob(f"{temp_output.stem}*{temp_output.suffix}") if path != temp_output
+        )
+        for path in timestamped_outputs:
+            for candidate in (path, path.with_suffix(path.suffix + ".faststart")):
+                if candidate not in seen:
+                    candidates.append(candidate)
+                    seen.add(candidate)
+        return candidates
 
 
 def _format_worker_failure(returncode: int, output: str) -> str:

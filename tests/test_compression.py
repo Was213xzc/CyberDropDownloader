@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import shutil
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -14,10 +15,14 @@ from cyberdrop_dl.config.config_model import CompressionOptions, ConfigSettings
 from cyberdrop_dl.managers.compression_manager import CompressionManager
 from cyberdrop_dl.utils import yaml
 from cyberdrop_dl.utils.pynv_transcode_worker import (
+    _candidate_outputs_for_cleanup,
     _optimize_mp4_for_streaming,
     _resolve_output,
     _retag_hevc_sample_entries,
     _stringify_config,
+)
+from cyberdrop_dl.utils.pynv_transcode_worker import (
+    main as pynv_worker_main,
 )
 
 if TYPE_CHECKING:
@@ -143,13 +148,64 @@ def test_pynv_worker_stringifies_config_and_resolves_segment_output() -> None:
     try:
         expected_output = root / "video.compressed.mp4"
         segmented_output = root / "video.compressed_0.000000_4.404400.mp4"
+        faststart_output = segmented_output.with_suffix(segmented_output.suffix + ".faststart")
         segmented_output.write_bytes(b"compressed")
+        faststart_output.write_bytes(b"faststart")
 
         assert _stringify_config({"constqp": 23, "usedevicememory": True}) == {
             "constqp": "23",
             "usedevicememory": "true",
         }
         assert _resolve_output(str(expected_output)) == segmented_output
+        assert faststart_output in _candidate_outputs_for_cleanup(expected_output)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_pynv_worker_prefers_full_file_mux_transcode(monkeypatch) -> None:
+    root = _reset_test_dir()
+    try:
+        source = root / "input.mkv"
+        output = root / "output.mkv"
+        source.write_bytes(b"source")
+        calls: list[str] = []
+
+        class FakeDecoder:
+            def __init__(self, path: str, gpu_id: int = 0, use_device_memory: bool = False) -> None:
+                calls.append(f"decode:{Path(path).name}:{gpu_id}:{use_device_memory}")
+
+            def get_stream_metadata(self) -> SimpleNamespace:
+                return SimpleNamespace(duration=1.0)
+
+            def __getitem__(self, index: int) -> bytes:
+                return b"frame"
+
+        class FakeTranscoder:
+            def __init__(
+                self,
+                enc_file_path: str,
+                muxed_file_path: str,
+                gpu_id: int,
+                cuda_context: int,
+                cuda_stream: int,
+                **kwargs: Any,
+            ) -> None:
+                calls.append(f"init:{Path(enc_file_path).name}:{Path(muxed_file_path).name}:{gpu_id}")
+                self.output = Path(muxed_file_path)
+
+            def transcode_with_mux(self) -> None:
+                calls.append("transcode_with_mux")
+                self.output.write_bytes(b"compressed")
+
+            def segmented_transcode(self, start: float, end: float) -> None:
+                raise AssertionError("segmented_transcode should not be used for whole-file compression")
+
+        fake_pynv = SimpleNamespace(Transcoder=FakeTranscoder, SimpleDecoder=FakeDecoder)
+        monkeypatch.setitem(sys.modules, "PyNvVideoCodec", fake_pynv)
+
+        assert pynv_worker_main([str(source), str(output), "0", '{"codec": "hevc"}']) == 0
+        assert output.read_bytes() == b"compressed"
+        assert "transcode_with_mux" in calls
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

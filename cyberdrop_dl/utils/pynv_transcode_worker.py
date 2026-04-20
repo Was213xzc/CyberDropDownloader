@@ -39,13 +39,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     import PyNvVideoCodec
 
     _delete_outputs(output)
-    duration = _get_duration(PyNvVideoCodec, source, int(gpu_id))
     transcoder = None
     try:
         transcoder = PyNvVideoCodec.Transcoder(source, output, int(gpu_id), 0, 0, **config)
-        if not hasattr(transcoder, "segmented_transcode"):
-            raise RuntimeError("PyNvVideoCodec transcoder does not expose segmented_transcode")
-        transcoder.segmented_transcode(0.0, duration)
+        if not hasattr(transcoder, "transcode_with_mux"):
+            raise RuntimeError("PyNvVideoCodec transcoder does not expose transcode_with_mux")
+        transcoder.transcode_with_mux()
     finally:
         del transcoder
         gc.collect()
@@ -63,13 +62,24 @@ def _stringify_config(config: dict) -> dict[str, str]:
 
 def _delete_outputs(output: str) -> None:
     template = Path(output)
-    for path in _candidate_outputs(template):
+    for path in _candidate_outputs_for_cleanup(template):
         path.unlink(missing_ok=True)
 
 
 def _candidate_outputs(template: Path) -> list[Path]:
     candidates = [template]
     candidates.extend(path for path in template.parent.glob(f"{template.stem}*{template.suffix}") if path != template)
+    return candidates
+
+
+def _candidate_outputs_for_cleanup(template: Path) -> list[Path]:
+    candidates = []
+    seen: set[Path] = set()
+    for path in _candidate_outputs(template):
+        for candidate in (path, path.with_suffix(path.suffix + ".faststart")):
+            if candidate not in seen:
+                candidates.append(candidate)
+                seen.add(candidate)
     return candidates
 
 
