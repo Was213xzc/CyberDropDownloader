@@ -820,6 +820,13 @@ def _sanitize_process_output(output: str, *, max_lines: int = 12, max_chars: int
     if not output:
         return ""
 
+    normalized_output = output.casefold()
+    if "invalid data found when processing input" in normalized_output or "avformat_open_input" in normalized_output:
+        return (
+            "PyNvVideoCodec could not open the input video. "
+            "The file is unsupported, corrupted, incomplete, or not a real video container."
+        )
+
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     frame_write_errors = sum(1 for line in lines if "error writing frame" in line.casefold())
     filtered_lines = [line for line in lines if "error writing frame" not in line.casefold()]

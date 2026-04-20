@@ -12,10 +12,11 @@ from PIL import Image
 
 from cyberdrop_dl.clients.download_client import DownloadClient
 from cyberdrop_dl.config.config_model import CompressionOptions, ConfigSettings
-from cyberdrop_dl.managers.compression_manager import CompressionManager
+from cyberdrop_dl.managers.compression_manager import CompressionManager, _sanitize_process_output
 from cyberdrop_dl.utils import yaml
 from cyberdrop_dl.utils.pynv_transcode_worker import (
     _candidate_outputs_for_cleanup,
+    _format_exception,
     _optimize_mp4_for_streaming,
     _resolve_output,
     _retag_hevc_sample_entries,
@@ -218,6 +219,28 @@ def test_pynv_retries_higher_cq_when_output_is_too_large() -> None:
         assert video.read_bytes() == b"y" * 50
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_pynv_invalid_input_errors_are_concise_and_non_retryable() -> None:
+    traceback_output = """
+Traceback (most recent call last):
+  File "pynv_transcode_worker.py", line 44, in main
+    transcoder = PyNvVideoCodec.Transcoder(...)
+_PyNvVideoCodec.PyNvVCException: FFmpegDemuxer::CreateFormatContext :
+Error code : -1094995529
+Error Type : avformat_open_input(&ctx, szFilePath, NULL, NULL) returned error " Invalid data found when processing input"
+"""
+    compression_manager = CompressionManager(cast("Any", FakeCompressionOwner()))
+
+    assert _format_exception(RuntimeError("Invalid data found when processing input")) == (
+        "PyNvVideoCodec could not open the input video. "
+        "The file is unsupported, corrupted, incomplete, or not a real video container."
+    )
+    assert _sanitize_process_output(traceback_output) == (
+        "PyNvVideoCodec could not open the input video. "
+        "The file is unsupported, corrupted, incomplete, or not a real video container."
+    )
+    assert compression_manager._should_retry_with_higher_cq(traceback_output, 23) is False
 
 
 def test_pynv_encoder_kwargs_use_gpu_buffers_constqp_and_b_frames() -> None:

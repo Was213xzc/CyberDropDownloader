@@ -45,19 +45,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not hasattr(transcoder, "transcode_with_mux"):
             raise RuntimeError("PyNvVideoCodec transcoder does not expose transcode_with_mux")
         transcoder.transcode_with_mux()
+        actual_output = _resolve_output(output)
+        _validate_output(PyNvVideoCodec, str(actual_output), int(gpu_id))
+        actual_output = _optimize_mp4_for_streaming(actual_output)
+        _retag_hevc_sample_entries(actual_output)
+        _validate_output(PyNvVideoCodec, str(actual_output), int(gpu_id))
+    except Exception as e:
+        _delete_outputs(output)
+        sys.stderr.write(f"{_format_exception(e)}\n")
+        return 1
     finally:
         del transcoder
         gc.collect()
-    actual_output = _resolve_output(output)
-    _validate_output(PyNvVideoCodec, str(actual_output), int(gpu_id))
-    actual_output = _optimize_mp4_for_streaming(actual_output)
-    _retag_hevc_sample_entries(actual_output)
-    _validate_output(PyNvVideoCodec, str(actual_output), int(gpu_id))
     return 0
 
 
 def _stringify_config(config: dict) -> dict[str, str]:
     return {key: str(value).lower() if isinstance(value, bool) else str(value) for key, value in config.items()}
+
+
+def _format_exception(error: Exception) -> str:
+    message = str(error).strip()
+    normalized = message.casefold()
+    if "invalid data found when processing input" in normalized or "avformat_open_input" in normalized:
+        return (
+            "PyNvVideoCodec could not open the input video. "
+            "The file is unsupported, corrupted, incomplete, or not a real video container."
+        )
+    if "error writing frame" in normalized:
+        return "PyNvVideoCodec failed while writing encoded frames"
+    return message or error.__class__.__name__
 
 
 def _delete_outputs(output: str) -> None:
