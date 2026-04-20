@@ -81,6 +81,7 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert options.compress_videos is True
         assert options.compress_images is True
         assert options.video_backend == "pynv"
+        assert options.ffmpeg_nvenc_fallback is True
         assert options.video_codec == "hevc"
         assert options.video_workers_per_gpu == 2
         assert options.hevc_cq == 23
@@ -88,6 +89,7 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert options.bf == 3
         assert options.gop == 60
         assert options.idrperiod == 60
+        assert options.image_min_savings_percent == 0
 
         assert CompressionOptions.model_validate({"video_workers_per_gpu": 99}).video_workers_per_gpu == 2
         assert CompressionOptions.model_validate({"video_workers_per_gpu": 0}).video_workers_per_gpu == 1
@@ -97,6 +99,8 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         serialized_config = yaml.load(config_file)
         assert serialized_config["compression_options"]["video_codec"] == "hevc"
         assert serialized_config["compression_options"]["video_workers_per_gpu"] == 2
+        assert serialized_config["compression_options"]["ffmpeg_nvenc_fallback"] is True
+        assert serialized_config["compression_options"]["image_min_savings_percent"] == 0
         assert ConfigSettings.model_validate(serialized_config).compression_options.hevc_cq == 23
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -107,7 +111,7 @@ def test_video_compression_skips_when_pynv_is_unavailable() -> None:
     try:
         video = root / "video.mp4"
         video.write_bytes(b"not a real video, but PyNv is checked before probing")
-        owner = FakeCompressionOwner()
+        owner = FakeCompressionOwner(CompressionOptions(ffmpeg_nvenc_fallback=False))
         compression_manager = CompressionManager(cast("Any", owner))
         compression_manager._import_pynv = lambda: None
 
@@ -118,6 +122,58 @@ def test_video_compression_skips_when_pynv_is_unavailable() -> None:
         assert result.error == "PyNvVideoCodec is not installed"
         assert owner.progress_manager.results == [("skipped", 0)]
         assert owner.log_manager.rows[0]["status"] == "skipped"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_video_compression_falls_back_to_ffmpeg_nvenc_after_pynv_failure() -> None:
+    root = _reset_test_dir()
+    try:
+        video = root / "video.mp4"
+        video.write_bytes(b"x" * 100)
+        owner = FakeCompressionOwner()
+        compression_manager = CompressionManager(cast("Any", owner))
+        calls: list[str] = []
+
+        async def fake_probe(source: Path) -> SimpleNamespace:
+            return SimpleNamespace(video=SimpleNamespace(codec="h264"))
+
+        async def fail_pynv(source: Path, output: Path, gpu_id: int, codec: str, cq: int) -> None:
+            calls.append(f"pynv:{gpu_id}:{codec}:{cq}")
+            raise RuntimeError("pynv crashed")
+
+        async def has_encoder(encoder: str) -> bool:
+            calls.append(f"encoder:{encoder}")
+            return True
+
+        async def transcode_ffmpeg(source: Path, output: Path, gpu_id: int, codec: str, cq: int) -> None:
+            calls.append(f"ffmpeg:{gpu_id}:{codec}:{cq}")
+            await asyncio.to_thread(output.write_bytes, b"y" * 50)
+
+        async def validate_video(path: Path) -> None:
+            calls.append(f"validate:{path.name}")
+
+        compression_manager._probe_if_available = fake_probe
+        compression_manager._import_pynv = lambda: object()
+        compression_manager._transcode_with_pynv_subprocess = fail_pynv
+        compression_manager._ffmpeg_has_encoder = has_encoder
+        compression_manager._transcode_with_ffmpeg_nvenc = transcode_ffmpeg
+        compression_manager._validate_video = validate_video
+
+        result = asyncio.run(compression_manager.compress_media_item(_media_item(video)))
+
+        assert result is not None
+        assert result.status == "compressed"
+        assert result.backend == "ffmpeg_nvenc"
+        assert video.read_bytes() == b"y" * 50
+        assert calls == [
+            "pynv:0:hevc:23",
+            "encoder:hevc_nvenc",
+            "ffmpeg:0:hevc:23",
+            "validate:video.compressed.mp4",
+        ]
+        assert owner.progress_manager.results == [("compressed", 50)]
+        assert owner.log_manager.rows[0]["backend"] == "ffmpeg_nvenc"
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -141,6 +197,30 @@ def test_pynv_encoder_kwargs_use_gpu_buffers_constqp_and_b_frames() -> None:
     assert hevc_kwargs["preset"] == "P6"
     assert hevc_kwargs["tuning_info"] == "high_quality"
     assert "gpu_id" not in hevc_kwargs
+
+
+def test_ffmpeg_nvenc_command_uses_cuda_constqp_audio_copy_and_faststart(monkeypatch) -> None:
+    monkeypatch.setattr("cyberdrop_dl.managers.compression_manager.ffmpeg.which_ffmpeg", lambda: "ffmpeg")
+    compression_manager = CompressionManager(cast("Any", FakeCompressionOwner()))
+
+    command = compression_manager._ffmpeg_nvenc_command(
+        Path("input.mp4"),
+        Path("input.compressed.mp4"),
+        1,
+        "hevc",
+        23,
+    )
+
+    assert command[:2] == ("ffmpeg", "-y")
+    assert ("-hwaccel", "cuda") == command[6:8]
+    assert ("-hwaccel_device", "1") == command[8:10]
+    assert "hevc_nvenc" in command
+    assert ("-rc", "constqp") == command[command.index("-rc") : command.index("-rc") + 2]
+    assert ("-qp", "23") == command[command.index("-qp") : command.index("-qp") + 2]
+    assert ("-bf", "3") == command[command.index("-bf") : command.index("-bf") + 2]
+    assert ("-c:a", "copy") == command[command.index("-c:a") : command.index("-c:a") + 2]
+    assert ("-movflags", "+faststart") == command[command.index("-movflags") : command.index("-movflags") + 2]
+    assert ("-tag:v", "hvc1") == command[command.index("-tag:v") : command.index("-tag:v") + 2]
 
 
 def test_pynv_worker_stringifies_config_and_resolves_segment_output() -> None:
@@ -421,6 +501,56 @@ def test_image_compression_preserves_extension_and_replaces_only_when_smaller() 
             compressed_image.verify()
         assert owner.progress_manager.results == [("compressed", original_size - image_path.stat().st_size)]
         assert owner.log_manager.rows[0]["media_type"] == "image"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_image_threshold_accepts_any_smaller_file_while_video_keeps_minimum_savings() -> None:
+    root = _reset_test_dir()
+    try:
+        source = root / "media.bin"
+        temp_output = root / "media.compressed.bin"
+        compression_manager = CompressionManager(cast("Any", FakeCompressionOwner(CompressionOptions())))
+
+        source.write_bytes(b"x" * 100)
+        temp_output.write_bytes(b"x" * 99)
+        compression_manager._validate_image = lambda path: None
+
+        image_result = asyncio.run(
+            compression_manager._finalize_output(
+                source,
+                temp_output,
+                "image",
+                media_type="image",
+                backend="pillow",
+                path=source,
+            )
+        )
+
+        assert image_result.status == "compressed"
+        assert source.stat().st_size == 99
+
+        source.write_bytes(b"x" * 100)
+        temp_output.write_bytes(b"x" * 99)
+
+        async def validate_video(path: Path) -> None:
+            return None
+
+        compression_manager._validate_video = validate_video
+        video_result = asyncio.run(
+            compression_manager._finalize_output(
+                source,
+                temp_output,
+                "video",
+                media_type="video",
+                backend="pynv",
+                path=source,
+            )
+        )
+
+        assert video_result.status == "skipped"
+        assert video_result.error == "Compressed output was not small enough"
+        assert source.stat().st_size == 100
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

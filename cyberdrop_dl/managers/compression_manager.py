@@ -75,6 +75,7 @@ class CompressionManager:
         self._queue: asyncio.Queue[CompressionQueueItem | None] = asyncio.Queue()
         self._queue_tasks: list[asyncio.Task[None]] = []
         self._video_semaphores: defaultdict[int, asyncio.BoundedSemaphore] = defaultdict(self._make_video_semaphore)
+        self._ffmpeg_encoder_cache: dict[str, bool] = {}
 
     @property
     def options(self) -> CompressionOptions:
@@ -186,18 +187,16 @@ class CompressionManager:
         options = self.options
         codec = options.video_codec
         cq = self._codec_cq(codec)
+        gpu_id = self._next_gpu_id()
         result_kwargs = {
             "media_type": "video",
             "backend": "pynv",
             "path": source,
+            "gpu_id": gpu_id,
             "codec": codec,
             "cq": cq,
             "bf": options.bf,
         }
-
-        pynv = self._import_pynv()
-        if pynv is None:
-            return CompressionResult(status="skipped", error="PyNvVideoCodec is not installed", **result_kwargs)
 
         try:
             if probe := await self._probe_if_available(source):
@@ -207,22 +206,84 @@ class CompressionManager:
                 if self._already_target_codec(video.codec, codec):
                     return CompressionResult(status="skipped", error=f"Already encoded as {codec}", **result_kwargs)
 
-            gpu_id = self._next_gpu_id()
-            result_kwargs["gpu_id"] = gpu_id
-            temp_output = source.with_name(f"{source.stem}.compressed{source.suffix}")
-            await self._delete_temp(temp_output)
-            try:
-                async with self._video_slot(gpu_id):
-                    await self._transcode_with_pynv_subprocess(source, temp_output, gpu_id, codec, cq)
-            except Exception as e:
-                await self._delete_temp(temp_output)
-                return CompressionResult(status="skipped", error=str(e), **result_kwargs)
-            temp_output = await asyncio.to_thread(self._resolve_pynv_output, source, temp_output)
-            return await self._finalize_output(source, temp_output, "video", **result_kwargs)
+            pynv_result = await self._compress_video_with_pynv(source, gpu_id, codec, cq, result_kwargs)
+            if pynv_result.status == "compressed" or not options.ffmpeg_nvenc_fallback:
+                return pynv_result
+
+            ffmpeg_result = await self._compress_video_with_ffmpeg_nvenc(source, gpu_id, codec, cq, result_kwargs)
+            if ffmpeg_result.status == "compressed":
+                return ffmpeg_result
+
+            combined_error = _join_backend_errors(
+                ("PyNvVideoCodec", pynv_result.error),
+                ("FFmpeg NVENC", ffmpeg_result.error),
+            )
+            return CompressionResult(
+                status="skipped",
+                error=combined_error,
+                original_size=ffmpeg_result.original_size or pynv_result.original_size,
+                final_size=ffmpeg_result.final_size or pynv_result.final_size,
+                **(result_kwargs | {"backend": "pynv+ffmpeg_nvenc"}),
+            )
         except Exception as e:
             await self._delete_temp(source.with_name(f"{source.stem}.compressed{source.suffix}"))
             log(f"Compression failed for {source}: {e}", 40, exc_info=True)
             return CompressionResult(status="failed", error=str(e), **result_kwargs)
+
+    async def _compress_video_with_pynv(
+        self,
+        source: Path,
+        gpu_id: int,
+        codec: str,
+        cq: int,
+        result_kwargs: dict,
+    ) -> CompressionResult:
+        pynv = self._import_pynv()
+        pynv_kwargs = result_kwargs | {"backend": "pynv"}
+        if pynv is None:
+            return CompressionResult(status="skipped", error="PyNvVideoCodec is not installed", **pynv_kwargs)
+
+        temp_output = source.with_name(f"{source.stem}.compressed{source.suffix}")
+        await self._delete_temp(temp_output)
+        try:
+            async with self._video_slot(gpu_id):
+                await self._transcode_with_pynv_subprocess(source, temp_output, gpu_id, codec, cq)
+        except Exception as e:
+            await self._delete_temp(temp_output)
+            return CompressionResult(status="skipped", error=str(e), **pynv_kwargs)
+
+        temp_output = await asyncio.to_thread(self._resolve_pynv_output, source, temp_output)
+        return await self._finalize_output(source, temp_output, "video", **pynv_kwargs)
+
+    async def _compress_video_with_ffmpeg_nvenc(
+        self,
+        source: Path,
+        gpu_id: int,
+        codec: str,
+        cq: int,
+        result_kwargs: dict,
+    ) -> CompressionResult:
+        ffmpeg_kwargs = result_kwargs | {"backend": "ffmpeg_nvenc"}
+        if source.suffix.casefold() not in {".mp4", ".m4v", ".mov", ".mkv"}:
+            return CompressionResult(
+                status="skipped",
+                error=f"FFmpeg NVENC fallback does not support '{source.suffix}' outputs",
+                **ffmpeg_kwargs,
+            )
+        encoder = self._ffmpeg_nvenc_encoder(codec)
+        if not await self._ffmpeg_has_encoder(encoder):
+            return CompressionResult(status="skipped", error=f"FFmpeg encoder '{encoder}' is not available", **ffmpeg_kwargs)
+
+        temp_output = source.with_name(f"{source.stem}.compressed{source.suffix}")
+        await self._delete_temp(temp_output)
+        try:
+            async with self._video_slot(gpu_id):
+                await self._transcode_with_ffmpeg_nvenc(source, temp_output, gpu_id, codec, cq)
+        except Exception as e:
+            await self._delete_temp(temp_output)
+            return CompressionResult(status="skipped", error=str(e), **ffmpeg_kwargs)
+
+        return await self._finalize_output(source, temp_output, "video", **ffmpeg_kwargs)
 
     async def _compress_image(self, source: Path) -> CompressionResult:
         result_kwargs = {"media_type": "image", "backend": "pillow", "path": source}
@@ -294,7 +355,7 @@ class CompressionManager:
             await self._delete_temp(temp_output)
             return CompressionResult(status="skipped", error=f"Compressed output failed validation: {e}", **result_kwargs)
 
-        if not self._meets_savings_threshold(original_size, final_size):
+        if not self._meets_savings_threshold(original_size, final_size, output_type):
             await self._delete_temp(temp_output)
             return CompressionResult(status="skipped", error="Compressed output was not small enough", **result_kwargs)
 
@@ -330,14 +391,7 @@ class CompressionManager:
         cq: int,
     ) -> None:
         config_json = json.dumps(self._pynv_transcode_kwargs(codec, cq))
-        _suppress_windows_error_dialogs()
-        kwargs = {
-            "stdout": asyncio.subprocess.PIPE,
-            "stderr": asyncio.subprocess.PIPE,
-        }
-        if sys.platform == "win32":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        process = await asyncio.create_subprocess_exec(
+        command = (
             sys.executable,
             "-m",
             "cyberdrop_dl.utils.pynv_transcode_worker",
@@ -345,8 +399,35 @@ class CompressionManager:
             str(temp_output),
             str(gpu_id),
             config_json,
-            **kwargs,
         )
+        await self._run_guarded_compressor_process(command, source, temp_output, "PyNvVideoCodec")
+
+    async def _transcode_with_ffmpeg_nvenc(
+        self,
+        source: Path,
+        temp_output: Path,
+        gpu_id: int,
+        codec: str,
+        cq: int,
+    ) -> None:
+        command = self._ffmpeg_nvenc_command(source, temp_output, gpu_id, codec, cq)
+        await self._run_guarded_compressor_process(command, source, temp_output, "FFmpeg NVENC")
+
+    async def _run_guarded_compressor_process(
+        self,
+        command: tuple[str, ...],
+        source: Path,
+        temp_output: Path,
+        backend_name: str,
+    ) -> None:
+        _suppress_windows_error_dialogs()
+        kwargs = {
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        process = await asyncio.create_subprocess_exec(*command, **kwargs)
         max_output_size = await asyncio.to_thread(self._max_acceptable_output_size, source)
         communicate_task = asyncio.create_task(process.communicate())
         try:
@@ -365,11 +446,11 @@ class CompressionManager:
                 output = (stderr or stdout).decode("utf8", errors="replace").strip()
                 name, size = oversized_output
                 msg = (
-                    f"PyNvVideoCodec output exceeded safe size limit for {source.name}: "
+                    f"{backend_name} output exceeded safe size limit for {source.name}: "
                     f"{name} reached {size:,} bytes, limit is {max_output_size:,} bytes"
                 )
                 if output:
-                    msg = f"{msg}\n{output}"
+                    msg = f"{msg}\n{_sanitize_process_output(output)}"
                 raise RuntimeError(msg)
             stdout, stderr = await communicate_task
         except Exception:
@@ -378,7 +459,104 @@ class CompressionManager:
             raise
         if process.returncode:
             output = (stderr or stdout).decode("utf8", errors="replace").strip()
-            raise RuntimeError(_format_worker_failure(process.returncode, output))
+            raise RuntimeError(_format_process_failure(backend_name, process.returncode, output))
+
+    def _ffmpeg_nvenc_command(self, source: Path, temp_output: Path, gpu_id: int, codec: str, cq: int) -> tuple[str, ...]:
+        bin_path = ffmpeg.which_ffmpeg()
+        if bin_path is None:
+            raise RuntimeError("ffmpeg is not available")
+
+        options = self.options
+        command = [
+            bin_path,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-hwaccel",
+            "cuda",
+            "-hwaccel_device",
+            str(gpu_id),
+            "-hwaccel_output_format",
+            "cuda",
+            "-i",
+            str(source),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-map_metadata",
+            "0",
+            "-c:v",
+            self._ffmpeg_nvenc_encoder(codec),
+            "-preset",
+            self._ffmpeg_nvenc_preset(options.preset),
+            "-tune",
+            self._ffmpeg_nvenc_tune(options.tuning_info),
+            "-rc",
+            "constqp",
+            "-qp",
+            str(cq),
+            "-bf",
+            str(options.bf),
+            "-g",
+            str(options.gop),
+            "-c:a",
+            "copy",
+            "-sn",
+        ]
+        if temp_output.suffix.casefold() in {".mp4", ".m4v", ".mov"}:
+            command.extend(("-movflags", "+faststart"))
+            if codec == "hevc":
+                command.extend(("-tag:v", "hvc1"))
+        command.append(str(temp_output))
+        return tuple(command)
+
+    async def _ffmpeg_has_encoder(self, encoder: str) -> bool:
+        if encoder in self._ffmpeg_encoder_cache:
+            return self._ffmpeg_encoder_cache[encoder]
+
+        bin_path = ffmpeg.which_ffmpeg()
+        if bin_path is None:
+            self._ffmpeg_encoder_cache[encoder] = False
+            return False
+
+        process = await asyncio.create_subprocess_exec(
+            bin_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-encoders",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        output = stdout.decode("utf8", errors="replace") + stderr.decode("utf8", errors="replace")
+        available = process.returncode == 0 and encoder in output
+        self._ffmpeg_encoder_cache[encoder] = available
+        return available
+
+    def _ffmpeg_nvenc_encoder(self, codec: str) -> str:
+        return "av1_nvenc" if codec == "av1" else "hevc_nvenc"
+
+    def _ffmpeg_nvenc_preset(self, preset: str) -> str:
+        normalized = preset.casefold()
+        if normalized in {"p1", "p2", "p3", "p4", "p5", "p6", "p7"}:
+            return normalized
+        return "p6"
+
+    def _ffmpeg_nvenc_tune(self, tuning_info: str) -> str:
+        normalized = tuning_info.casefold().replace("-", "_")
+        return {
+            "high_quality": "hq",
+            "hq": "hq",
+            "low_latency": "ll",
+            "ll": "ll",
+            "ultra_low_latency": "ull",
+            "ull": "ull",
+            "lossless": "lossless",
+        }.get(normalized, "hq")
 
     def _max_acceptable_output_size(self, source: Path) -> int:
         source_size = source.stat().st_size
@@ -491,8 +669,13 @@ class CompressionManager:
             return normalized in {"hevc", "h265"}
         return normalized == target_codec
 
-    def _meets_savings_threshold(self, original_size: int, final_size: int) -> bool:
-        threshold = 1 - (self.options.min_savings_percent / 100)
+    def _meets_savings_threshold(self, original_size: int, final_size: int, output_type: MediaType) -> bool:
+        min_savings_percent = (
+            self.options.image_min_savings_percent if output_type == "image" else self.options.min_savings_percent
+        )
+        if min_savings_percent <= 0:
+            return final_size < original_size
+        threshold = 1 - (min_savings_percent / 100)
         return final_size < original_size * threshold
 
     async def _record_result(self, media_item: MediaItem, result: CompressionResult) -> None:
@@ -579,11 +762,37 @@ class CompressionManager:
 
 
 def _format_worker_failure(returncode: int, output: str) -> str:
+    return _format_process_failure("PyNvVideoCodec worker", returncode, output)
+
+
+def _format_process_failure(process_name: str, returncode: int, output: str) -> str:
+    output = _sanitize_process_output(output)
     if output:
-        return output
+        return f"{process_name} failed with exit code {returncode}:\n{output}"
     if sys.platform == "win32":
-        return f"PyNvVideoCodec worker failed with exit code {returncode} (0x{returncode & 0xFFFFFFFF:08X})"
-    return f"PyNvVideoCodec worker failed with exit code {returncode}"
+        return f"{process_name} failed with exit code {returncode} (0x{returncode & 0xFFFFFFFF:08X})"
+    return f"{process_name} failed with exit code {returncode}"
+
+
+def _sanitize_process_output(output: str, *, max_lines: int = 12, max_chars: int = 2000) -> str:
+    if not output:
+        return ""
+
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    frame_write_errors = sum(1 for line in lines if "error writing frame" in line.casefold())
+    filtered_lines = [line for line in lines if "error writing frame" not in line.casefold()]
+    if frame_write_errors:
+        filtered_lines.append(f"Error writing frame repeated {frame_write_errors} times")
+
+    text = "\n".join(filtered_lines[-max_lines:])
+    if len(text) > max_chars:
+        text = f"{text[-max_chars:]}\n... output truncated ..."
+    return text
+
+
+def _join_backend_errors(*errors: tuple[str, str]) -> str:
+    formatted = [f"{backend}: {error}" for backend, error in errors if error]
+    return "; ".join(formatted) or "All video compression backends failed"
 
 
 def _suppress_windows_error_dialogs() -> None:

@@ -291,6 +291,7 @@ class CompressionOptions(BaseModel):
     compress_videos: bool = True
     compress_images: bool = True
     video_backend: NonEmptyStr = "pynv"
+    ffmpeg_nvenc_fallback: bool = True
     video_codec: NonEmptyStr = "hevc"
     gpu_ids: list[NonNegativeInt] = [0]
     video_workers_per_gpu: PositiveInt = Field(2, le=2)
@@ -302,6 +303,7 @@ class CompressionOptions(BaseModel):
     preset: NonEmptyStr = "P6"
     tuning_info: NonEmptyStr = "high_quality"
     min_savings_percent: NonNegativeInt = 5
+    image_min_savings_percent: NonNegativeInt = 0
     jpeg_quality: PositiveInt = Field(85, le=95)
     webp_quality: PositiveInt = Field(80, le=100)
     png_optimize: bool = True
