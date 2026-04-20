@@ -139,6 +139,23 @@ class HistoryTable:
         cursor = await self.db_conn.execute(query, params)
         return await cursor.fetchone() is not None
 
+    async def check_complete_by_filename_size(self, domain: str, filename: str | None, file_size: int | None) -> bool:
+        """Checks whether a same-domain file with this name and size has already completed."""
+        if self._database.ignore_history or not filename or not file_size:
+            return False
+
+        query = """
+        SELECT 1
+        FROM media
+        WHERE domain = ?
+          AND download_filename = ?
+          AND file_size = ?
+          AND completed != 0
+        LIMIT 1;
+        """
+        cursor = await self.db_conn.execute(query, (domain, filename, file_size))
+        return await cursor.fetchone() is not None
+
     async def insert_incompleted(self, domain: str, media_item: MediaItem) -> None:
         """Inserts an uncompleted file into the database."""
 
@@ -184,11 +201,12 @@ class HistoryTable:
         await self.db_conn.execute(query, (domain, url_path))
         await self.db_conn.commit()
 
-    async def add_filesize(self, domain: str, media_item: MediaItem) -> None:
+    async def add_filesize(self, domain: str, media_item: MediaItem, file_size: int | None = None) -> None:
         """Adds the file size to the db."""
 
         url_path = media_item.db_path
-        file_size = media_item.complete_file.stat().st_size
+        if file_size is None:
+            file_size = media_item.complete_file.stat().st_size
         query = """UPDATE media SET file_size=? WHERE domain = ? and url_path = ?"""
         await self.db_conn.execute(query, (file_size, domain, url_path))
         await self.db_conn.commit()
@@ -224,8 +242,7 @@ class HistoryTable:
         query = "SELECT EXISTS(SELECT 1 FROM media WHERE download_filename = ?)"
         cursor = await self.db_conn.execute(query, (filename,))
         row = await cursor.fetchone()
-        # TODO: this is a bug. It should check the first index
-        return row == 1
+        return bool(row and row[0])
 
     async def get_downloaded_filename(self, domain: str, media_item: MediaItem) -> str | None:
         """Returns the downloaded filename from the database."""

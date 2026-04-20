@@ -77,4 +77,6 @@ create_history_indexes = """
 CREATE INDEX IF NOT EXISTS idx_media_referer_domain_completed ON media (referer, domain, completed);
 CREATE INDEX IF NOT EXISTS idx_media_domain_album_completed ON media (domain, album_id, completed, url_path);
 CREATE INDEX IF NOT EXISTS idx_media_download_filename ON media (download_filename);
+CREATE INDEX IF NOT EXISTS idx_media_domain_filename_size_completed
+ON media (domain, download_filename, file_size, completed);
 """

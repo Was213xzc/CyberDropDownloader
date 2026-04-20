@@ -25,6 +25,7 @@ async def test_history_table_creates_lookup_indexes() -> None:
     assert "idx_media_referer_domain_completed" in index_names
     assert "idx_media_domain_album_completed" in index_names
     assert "idx_media_download_filename" in index_names
+    assert "idx_media_domain_filename_size_completed" in index_names
     await conn.close()
 
 
@@ -46,4 +47,45 @@ async def test_check_complete_by_referer_only_needs_one_completed_match() -> Non
 
     assert await table.check_complete_by_referer("bunkr", referer) is True
     assert await table.check_complete_by_referer("gofile", referer) is False
+    await conn.close()
+
+
+async def test_check_complete_by_filename_size_matches_same_domain_completed_item() -> None:
+    table, conn = await _create_history_table()
+    await conn.executemany(
+        """
+        INSERT INTO media (domain, url_path, referer, album_id, download_path,
+        download_filename, original_filename, file_size, completed)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            ("bunkr", "/one.mp4", "https://bunkr.site/a/album-1", "album-1", "downloads", "one.mp4", "one.mp4", 123, 1),
+            ("bunkr", "/two.mp4", "https://bunkr.site/a/album-2", "album-2", "downloads", "two.mp4", "two.mp4", 123, 0),
+        ],
+    )
+    await conn.commit()
+
+    assert await table.check_complete_by_filename_size("bunkr", "one.mp4", 123) is True
+    assert await table.check_complete_by_filename_size("bunkr", "one.mp4", 456) is False
+    assert await table.check_complete_by_filename_size("gofile", "one.mp4", 123) is False
+    assert await table.check_complete_by_filename_size("bunkr", "two.mp4", 123) is False
+    assert await table.check_complete_by_filename_size("bunkr", None, 123) is False
+    assert await table.check_complete_by_filename_size("bunkr", "one.mp4", None) is False
+    await conn.close()
+
+
+async def test_check_filename_exists_reads_sqlite_exists_result() -> None:
+    table, conn = await _create_history_table()
+    await conn.execute(
+        """
+        INSERT INTO media (domain, url_path, referer, album_id, download_path,
+        download_filename, original_filename, completed)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("bunkr", "/one.mp4", "https://bunkr.site/a/album", "album", "downloads", "one.mp4", "one.mp4", 1),
+    )
+    await conn.commit()
+
+    assert await table.check_filename_exists("one.mp4") is True
+    assert await table.check_filename_exists("missing.mp4") is False
     await conn.close()

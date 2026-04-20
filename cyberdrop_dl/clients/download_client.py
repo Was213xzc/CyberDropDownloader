@@ -149,6 +149,16 @@ class DownloadClient:
                 await self.handle_media_item_completion(media_item, downloaded=False)
 
                 return False
+            if await self.check_duplicate_filename_size(domain, media_item):
+                log(
+                    f"Skipping {media_item.url} because {media_item.download_filename} "
+                    "with the same file size has already been downloaded",
+                    10,
+                )
+                self.manager.progress_manager.download_progress.add_previously_completed(False)
+                await self.process_completed(media_item, domain)
+                await self.handle_media_item_completion(media_item, downloaded=False)
+                return False
 
         if resp.status != HTTPStatus.PARTIAL_CONTENT:
             await asyncio.to_thread(media_item.partial_file.unlink, missing_ok=True)
@@ -340,8 +350,24 @@ class DownloadClient:
     async def add_file_size(self, domain: str, media_item: MediaItem) -> None:
         if not media_item.complete_file:
             media_item.complete_file = self.get_file_location(media_item)
-        if await asyncio.to_thread(media_item.complete_file.is_file):
-            await self.manager.db_manager.history_table.add_filesize(domain, media_item)
+        file_size = await asyncio.to_thread(self._get_completed_file_size, media_item)
+        if file_size is None:
+            file_size = media_item.filesize
+        if file_size is not None:
+            await self.manager.db_manager.history_table.add_filesize(domain, media_item, file_size)
+
+    def _get_completed_file_size(self, media_item: MediaItem) -> int | None:
+        if media_item.complete_file.is_file():
+            return media_item.complete_file.stat().st_size
+        return None
+
+    async def check_duplicate_filename_size(self, domain: str, media_item: MediaItem) -> bool:
+        """Checks history for a completed same-domain file with this final name and size."""
+        return await self.manager.db_manager.history_table.check_complete_by_filename_size(
+            domain,
+            media_item.download_filename,
+            media_item.filesize,
+        )
 
     async def handle_media_item_completion(self, media_item: MediaItem, downloaded: bool = False) -> None:
         """Sends to hash client to handle hashing and marks as completed/current download."""
