@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -35,6 +35,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     actual_output = _resolve_output(output)
     _validate_output(PyNvVideoCodec, str(actual_output), int(gpu_id))
     actual_output = _optimize_mp4_for_streaming(actual_output)
+    _retag_hevc_sample_entries(actual_output)
     _validate_output(PyNvVideoCodec, str(actual_output), int(gpu_id))
     return 0
 
@@ -88,6 +89,63 @@ def _optimize_mp4_for_streaming(path: Path) -> Path:
 
     faststart_path.replace(path)
     return path
+
+
+def _retag_hevc_sample_entries(path: Path) -> None:
+    if path.suffix.casefold() not in {".mp4", ".m4v", ".mov"}:
+        return
+
+    atoms = _read_top_level_atoms(path)
+    moov = next((atom for atom in atoms if atom.type == b"moov"), None)
+    if moov is None:
+        return
+
+    with path.open("rb") as input_file:
+        input_file.seek(moov.offset)
+        moov_bytes = input_file.read(moov.size)
+
+    relative_offsets = list(_find_hev1_sample_entries(moov_bytes, 8, len(moov_bytes)))
+    if not relative_offsets:
+        return
+
+    with path.open("r+b") as output_file:
+        for relative_offset in relative_offsets:
+            output_file.seek(moov.offset + relative_offset)
+            output_file.write(b"hvc1")
+
+
+def _find_hev1_sample_entries(data: bytes, start: int, end: int) -> Iterator[int]:
+    position = start
+    while position + 8 <= end:
+        atom_size = int.from_bytes(data[position : position + 4], "big")
+        atom_type = bytes(data[position + 4 : position + 8])
+        header_size = 8
+        if atom_size == 1:
+            atom_size = int.from_bytes(data[position + 8 : position + 16], "big")
+            header_size = 16
+        elif atom_size == 0:
+            atom_size = end - position
+        if atom_size < header_size or position + atom_size > end:
+            return
+
+        content_start = position + header_size
+        atom_end = position + atom_size
+        if atom_type == b"stsd":
+            yield from _walk_sample_entries_for_hev1(data, content_start + 8, atom_end)
+        elif atom_type in _CONTAINER_ATOMS:
+            yield from _find_hev1_sample_entries(data, content_start, atom_end)
+        position = atom_end
+
+
+def _walk_sample_entries_for_hev1(data: bytes, start: int, end: int) -> Iterator[int]:
+    position = start
+    while position + 8 <= end:
+        entry_size = int.from_bytes(data[position : position + 4], "big")
+        if entry_size < 8 or position + entry_size > end:
+            return
+        if bytes(data[position + 4 : position + 8]) == b"hev1":
+            yield position + 4
+        position += entry_size
 
 
 class _Mp4Atom:

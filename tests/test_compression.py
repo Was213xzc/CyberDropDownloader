@@ -13,7 +13,12 @@ from cyberdrop_dl.clients.download_client import DownloadClient
 from cyberdrop_dl.config.config_model import CompressionOptions, ConfigSettings
 from cyberdrop_dl.managers.compression_manager import CompressionManager
 from cyberdrop_dl.utils import yaml
-from cyberdrop_dl.utils.pynv_transcode_worker import _optimize_mp4_for_streaming, _resolve_output, _stringify_config
+from cyberdrop_dl.utils.pynv_transcode_worker import (
+    _optimize_mp4_for_streaming,
+    _resolve_output,
+    _retag_hevc_sample_entries,
+    _stringify_config,
+)
 
 if TYPE_CHECKING:
     from cyberdrop_dl.data_structures.url_objects import MediaItem
@@ -174,6 +179,68 @@ def test_mp4_faststart_moves_moov_before_mdat_and_patches_offsets() -> None:
 
 def _mp4_atom(atom_type: bytes, payload: bytes) -> bytes:
     return (len(payload) + 8).to_bytes(4, "big") + atom_type + payload
+
+
+def test_retag_hevc_sample_entries_rewrites_hev1_to_hvc1_for_thumbnails() -> None:
+    root = _reset_test_dir()
+    try:
+        video_path = root / "video.mp4"
+        hvcC = _mp4_atom(b"hvcC", b"\x01" * 23)
+        sample_entry_payload = (
+            b"\x00" * 6
+            + b"\x00\x01"
+            + b"\x00" * 16
+            + b"\x00\x80\x00\x80"
+            + b"\x00" * 14
+            + b"\x18\x00\xff\xff"
+            + hvcC
+        )
+        hev1 = _mp4_atom(b"hev1", sample_entry_payload)
+        stsd = _mp4_atom(b"stsd", b"\x00\x00\x00\x00" + (1).to_bytes(4, "big") + hev1)
+        moov = _mp4_atom(
+            b"moov",
+            _mp4_atom(b"trak", _mp4_atom(b"mdia", _mp4_atom(b"minf", _mp4_atom(b"stbl", stsd)))),
+        )
+        ftyp = _mp4_atom(b"ftyp", b"isom" + b"\x00" * 4)
+        mdat = _mp4_atom(b"mdat", b"x" * 32)
+        original_bytes = ftyp + moov + mdat
+        video_path.write_bytes(original_bytes)
+
+        _retag_hevc_sample_entries(video_path)
+
+        rewritten = video_path.read_bytes()
+        assert rewritten.find(b"hvc1") != -1
+        assert rewritten.find(b"hev1") == -1
+        assert rewritten.find(b"hvcC") != -1
+        assert len(rewritten) == len(original_bytes)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_retag_hevc_sample_entries_skips_non_hevc_streams_and_non_mp4_files() -> None:
+    root = _reset_test_dir()
+    try:
+        avc_path = root / "avc.mp4"
+        avc1 = _mp4_atom(b"avc1", b"\x00" * 86)
+        stsd = _mp4_atom(b"stsd", b"\x00\x00\x00\x00" + (1).to_bytes(4, "big") + avc1)
+        moov = _mp4_atom(
+            b"moov",
+            _mp4_atom(b"trak", _mp4_atom(b"mdia", _mp4_atom(b"minf", _mp4_atom(b"stbl", stsd)))),
+        )
+        ftyp = _mp4_atom(b"ftyp", b"isom" + b"\x00" * 4)
+        mdat = _mp4_atom(b"mdat", b"x" * 16)
+        avc_bytes = ftyp + moov + mdat
+        avc_path.write_bytes(avc_bytes)
+        _retag_hevc_sample_entries(avc_path)
+        assert avc_path.read_bytes() == avc_bytes
+
+        mkv_path = root / "video.mkv"
+        mkv_bytes = b"hev1" + b"\x00" * 32
+        mkv_path.write_bytes(mkv_bytes)
+        _retag_hevc_sample_entries(mkv_path)
+        assert mkv_path.read_bytes() == mkv_bytes
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_pynv_transcode_uses_installed_transcoder_api_shape() -> None:
