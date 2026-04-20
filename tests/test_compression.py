@@ -335,6 +335,8 @@ def test_video_slots_allow_at_most_two_jobs_per_gpu() -> None:
     active_by_gpu = {0: 0, 1: 0}
     peak_by_gpu = {0: 0, 1: 0}
 
+    assert compression_manager._queue_worker_count() == 4
+
     async def run_job(gpu_id: int) -> None:
         async with compression_manager._video_slot(gpu_id):
             active_by_gpu[gpu_id] += 1
@@ -423,18 +425,32 @@ def test_image_compression_preserves_extension_and_replaces_only_when_smaller() 
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_compression_queue_processes_completed_downloads_fifo() -> None:
-    async def run_queue() -> list[str]:
-        owner = FakeCompressionOwner()
+def test_compression_queue_runs_workers_in_parallel_for_throughput() -> None:
+    async def run_queue() -> tuple[int, list[str], bool]:
+        owner = FakeCompressionOwner(CompressionOptions(gpu_ids=[0], video_workers_per_gpu=2))
         compression_manager = CompressionManager(cast("Any", owner))
         order: list[str] = []
+        active = 0
+        peak_active = 0
+        both_workers_active = asyncio.Event()
         media_items = [
             cast("MediaItem", SimpleNamespace(complete_file=Path("one.jpg"), filename="one.jpg", is_segment=False)),
             cast("MediaItem", SimpleNamespace(complete_file=Path("two.jpg"), filename="two.jpg", is_segment=False)),
+            cast("MediaItem", SimpleNamespace(complete_file=Path("three.jpg"), filename="three.jpg", is_segment=False)),
+            cast("MediaItem", SimpleNamespace(complete_file=Path("four.jpg"), filename="four.jpg", is_segment=False)),
         ]
 
         async def fake_compress(media_item: MediaItem) -> None:
-            order.append(f"compress:{media_item.filename}")
+            nonlocal active, peak_active
+            active += 1
+            peak_active = max(peak_active, active)
+            if peak_active >= 2:
+                both_workers_active.set()
+            try:
+                await asyncio.wait_for(both_workers_active.wait(), timeout=1)
+                order.append(f"compress:{media_item.filename}")
+            finally:
+                active -= 1
 
         async def fake_process(media_item: MediaItem, domain: str) -> None:
             order.append(f"process:{domain}:{media_item.filename}")
@@ -459,20 +475,19 @@ def test_compression_queue_processes_completed_downloads_fifo() -> None:
             )
 
         await compression_manager.join()
-        assert not completion_lock.locked()
+        lock_released = not completion_lock.locked()
         await compression_manager.close()
-        return order
+        return peak_active, order, lock_released
 
-    assert asyncio.run(run_queue()) == [
-        "compress:one.jpg",
-        "process:example.com:one.jpg",
-        "handle:True:one.jpg",
-        "finalize:True:one.jpg",
-        "compress:two.jpg",
-        "process:example.com:two.jpg",
-        "handle:True:two.jpg",
-        "finalize:True:two.jpg",
-    ]
+    peak_active, order, lock_released = asyncio.run(run_queue())
+
+    assert peak_active == 2
+    assert lock_released
+    for filename in ("one.jpg", "two.jpg", "three.jpg", "four.jpg"):
+        assert f"compress:{filename}" in order
+        assert f"process:example.com:{filename}" in order
+        assert f"handle:True:{filename}" in order
+        assert f"finalize:True:{filename}" in order
 
 
 def test_download_lifecycle_enqueues_after_rename_and_duration_check() -> None:

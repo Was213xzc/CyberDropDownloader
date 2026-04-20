@@ -73,7 +73,7 @@ class CompressionManager:
         self._gpu_index = 0
         self._pynv_unavailable_logged = False
         self._queue: asyncio.Queue[CompressionQueueItem | None] = asyncio.Queue()
-        self._queue_task: asyncio.Task[None] | None = None
+        self._queue_tasks: list[asyncio.Task[None]] = []
         self._video_semaphores: defaultdict[int, asyncio.BoundedSemaphore] = defaultdict(self._make_video_semaphore)
 
     @property
@@ -81,21 +81,25 @@ class CompressionManager:
         return self.manager.config.compression_options
 
     def startup(self) -> None:
-        if self._queue_task is None or self._queue_task.done():
-            self._queue_task = asyncio.create_task(self._run_queue(), name="cyberdrop-compression-queue")
+        self._queue_tasks = [task for task in self._queue_tasks if not task.done()]
+        for worker_id in range(len(self._queue_tasks), self._queue_worker_count()):
+            self._queue_tasks.append(
+                asyncio.create_task(self._run_queue_worker(), name=f"cyberdrop-compression-worker-{worker_id + 1}")
+            )
 
     async def close(self) -> None:
         await self.join()
-        if self._queue_task is None:
+        if not self._queue_tasks:
             return
 
-        await self._queue.put(None)
+        for _ in self._queue_tasks:
+            await self._queue.put(None)
         with contextlib.suppress(asyncio.CancelledError):
-            await self._queue_task
-        self._queue_task = None
+            await asyncio.gather(*self._queue_tasks)
+        self._queue_tasks.clear()
 
     async def join(self) -> None:
-        if self._queue_task is None:
+        if not self._queue_tasks:
             return
         await self._queue.join()
 
@@ -123,7 +127,7 @@ class CompressionManager:
             )
         )
 
-    async def _run_queue(self) -> None:
+    async def _run_queue_worker(self) -> None:
         while True:
             item = await self._queue.get()
             try:
@@ -150,6 +154,11 @@ class CompressionManager:
         finally:
             if item.completion_lock is not None and item.completion_lock.locked():
                 item.completion_lock.release()
+
+    def _queue_worker_count(self) -> int:
+        gpu_ids = self.options.gpu_ids or [0]
+        workers_per_gpu = min(max(int(self.options.video_workers_per_gpu), 1), 2)
+        return max(1, len(gpu_ids) * workers_per_gpu)
 
     async def compress_media_item(self, media_item: MediaItem) -> CompressionResult | None:
         options = self.options
