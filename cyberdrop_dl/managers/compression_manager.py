@@ -243,17 +243,37 @@ class CompressionManager:
         if pynv is None:
             return CompressionResult(status="skipped", error="PyNvVideoCodec is not installed", **pynv_kwargs)
 
-        temp_output = source.with_name(f"{source.stem}.compressed{source.suffix}")
-        await self._delete_temp(temp_output)
-        try:
-            async with self._video_slot(gpu_id):
-                await self._transcode_with_pynv_subprocess(source, temp_output, gpu_id, codec, cq)
-        except Exception as e:
+        temp_output_template = source.with_name(f"{source.stem}.compressed{source.suffix}")
+        errors: list[str] = []
+        cq_attempts = self._video_cq_attempts(codec)
+        for attempt_cq in cq_attempts:
+            attempt_kwargs = pynv_kwargs | {"cq": attempt_cq}
+            temp_output = temp_output_template
             await self._delete_temp(temp_output)
-            return CompressionResult(status="skipped", error=str(e), **pynv_kwargs)
+            try:
+                async with self._video_slot(gpu_id):
+                    await self._transcode_with_pynv_subprocess(source, temp_output, gpu_id, codec, attempt_cq)
+            except Exception as e:
+                await self._delete_temp(temp_output)
+                error = str(e)
+                errors.append(f"CQ {attempt_cq}: {error}")
+                if self._should_retry_with_higher_cq(error, attempt_cq):
+                    continue
+                return CompressionResult(status="skipped", error=error, **attempt_kwargs)
 
-        temp_output = await asyncio.to_thread(self._resolve_pynv_output, source, temp_output)
-        return await self._finalize_output(source, temp_output, "video", **pynv_kwargs)
+            actual_output = await asyncio.to_thread(self._resolve_pynv_output, source, temp_output)
+            result = await self._finalize_output(source, actual_output, "video", **attempt_kwargs)
+            if result.status == "compressed":
+                return result
+            errors.append(f"CQ {attempt_cq}: {result.error}")
+            if not self._should_retry_with_higher_cq(result.error, attempt_cq):
+                return result
+
+        return CompressionResult(
+            status="skipped",
+            error=_summarize_retry_errors("PyNvVideoCodec could not create a small enough output", errors),
+            **(pynv_kwargs | {"cq": cq_attempts[-1]}),
+        )
 
     async def _compress_video_with_ffmpeg_nvenc(
         self,
@@ -663,6 +683,28 @@ class CompressionManager:
     def _codec_cq(self, codec: str) -> int:
         return self.options.av1_cq if codec == "av1" else self.options.hevc_cq
 
+    def _video_cq_attempts(self, codec: str) -> list[int]:
+        base_cq = self._codec_cq(codec)
+        max_cq = max(base_cq, int(self.options.video_cq_max))
+        step = max(1, int(self.options.video_cq_retry_step))
+        attempts = list(range(base_cq, max_cq + 1, step))
+        if attempts[-1] != max_cq:
+            attempts.append(max_cq)
+        return attempts
+
+    def _should_retry_with_higher_cq(self, error: str, cq: int) -> bool:
+        if cq >= int(self.options.video_cq_max):
+            return False
+        normalized = error.casefold()
+        return any(
+            marker in normalized
+            for marker in (
+                "output exceeded safe size limit",
+                "compressed output was not small enough",
+                "error writing frame",
+            )
+        )
+
     def _already_target_codec(self, input_codec: str, target_codec: str) -> bool:
         normalized = input_codec.casefold()
         if target_codec == "hevc":
@@ -793,6 +835,12 @@ def _sanitize_process_output(output: str, *, max_lines: int = 12, max_chars: int
 def _join_backend_errors(*errors: tuple[str, str]) -> str:
     formatted = [f"{backend}: {error}" for backend, error in errors if error]
     return "; ".join(formatted) or "All video compression backends failed"
+
+
+def _summarize_retry_errors(prefix: str, errors: list[str], *, max_errors: int = 3) -> str:
+    if not errors:
+        return prefix
+    return f"{prefix} after retries: {'; '.join(errors[-max_errors:])}"
 
 
 def _suppress_windows_error_dialogs() -> None:

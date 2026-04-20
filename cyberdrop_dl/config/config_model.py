@@ -297,6 +297,8 @@ class CompressionOptions(BaseModel):
     video_workers_per_gpu: PositiveInt = Field(2, le=2)
     hevc_cq: NonNegativeInt = 23
     av1_cq: NonNegativeInt = 26
+    video_cq_retry_step: PositiveInt = 4
+    video_cq_max: PositiveInt = 35
     bf: NonNegativeInt = 3
     gop: PositiveInt = 60
     idrperiod: PositiveInt = 60

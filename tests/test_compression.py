@@ -86,6 +86,8 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert options.video_workers_per_gpu == 2
         assert options.hevc_cq == 23
         assert options.av1_cq == 26
+        assert options.video_cq_retry_step == 4
+        assert options.video_cq_max == 35
         assert options.bf == 3
         assert options.gop == 60
         assert options.idrperiod == 60
@@ -101,6 +103,8 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert serialized_config["compression_options"]["video_workers_per_gpu"] == 2
         assert serialized_config["compression_options"]["ffmpeg_nvenc_fallback"] is True
         assert serialized_config["compression_options"]["image_min_savings_percent"] == 0
+        assert serialized_config["compression_options"]["video_cq_retry_step"] == 4
+        assert serialized_config["compression_options"]["video_cq_max"] == 35
         assert ConfigSettings.model_validate(serialized_config).compression_options.hevc_cq == 23
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -174,6 +178,44 @@ def test_video_compression_falls_back_to_ffmpeg_nvenc_after_pynv_failure() -> No
         ]
         assert owner.progress_manager.results == [("compressed", 50)]
         assert owner.log_manager.rows[0]["backend"] == "ffmpeg_nvenc"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_pynv_retries_higher_cq_when_output_is_too_large() -> None:
+    root = _reset_test_dir()
+    try:
+        video = root / "video.mp4"
+        video.write_bytes(b"x" * 100)
+        owner = FakeCompressionOwner(CompressionOptions(ffmpeg_nvenc_fallback=False))
+        compression_manager = CompressionManager(cast("Any", owner))
+        calls: list[int] = []
+
+        async def fake_probe(source: Path) -> SimpleNamespace:
+            return SimpleNamespace(video=SimpleNamespace(codec="h264"))
+
+        async def transcode_pynv(source: Path, output: Path, gpu_id: int, codec: str, cq: int) -> None:
+            calls.append(cq)
+            if cq == 23:
+                raise RuntimeError("PyNvVideoCodec output exceeded safe size limit")
+            await asyncio.to_thread(output.write_bytes, b"y" * 50)
+
+        async def validate_video(path: Path) -> None:
+            return None
+
+        compression_manager._probe_if_available = fake_probe
+        compression_manager._import_pynv = lambda: object()
+        compression_manager._transcode_with_pynv_subprocess = transcode_pynv
+        compression_manager._validate_video = validate_video
+
+        result = asyncio.run(compression_manager.compress_media_item(_media_item(video)))
+
+        assert result is not None
+        assert result.status == "compressed"
+        assert result.backend == "pynv"
+        assert result.cq == 27
+        assert calls == [23, 27]
+        assert video.read_bytes() == b"y" * 50
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
