@@ -701,7 +701,9 @@ class CompressionManager:
             for marker in (
                 "output exceeded safe size limit",
                 "compressed output was not small enough",
+                "created an invalid output video",
                 "error writing frame",
+                "failed while writing encoded frames",
             )
         )
 
@@ -724,21 +726,24 @@ class CompressionManager:
         if hasattr(self.manager, "progress_manager"):
             self.manager.progress_manager.add_compression_result(result.status, result.bytes_saved)
         if hasattr(self.manager, "log_manager"):
-            await self.manager.log_manager.write_compression_report(
-                url=media_item.url,
-                path=result.path,
-                media_type=result.media_type,
-                status=result.status,
-                backend=result.backend,
-                gpu_id=result.gpu_id,
-                codec=result.codec,
-                cq=result.cq,
-                bf=result.bf,
-                original_size=result.original_size,
-                final_size=result.final_size,
-                savings_percent=result.savings_percent,
-                error=result.error,
-            )
+            try:
+                await self.manager.log_manager.write_compression_report(
+                    url=media_item.url,
+                    path=result.path,
+                    media_type=result.media_type,
+                    status=result.status,
+                    backend=result.backend,
+                    gpu_id=result.gpu_id,
+                    codec=result.codec,
+                    cq=result.cq,
+                    bf=result.bf,
+                    original_size=result.original_size,
+                    final_size=result.final_size,
+                    savings_percent=result.savings_percent,
+                    error=result.error,
+                )
+            except OSError as e:
+                log(f"Unable to write compression report row for {result.path}: {e}", 30)
 
     def _import_pynv(self) -> ModuleType | None:
         try:
@@ -810,7 +815,14 @@ def _format_worker_failure(returncode: int, output: str) -> str:
 def _format_process_failure(process_name: str, returncode: int, output: str) -> str:
     output = _sanitize_process_output(output)
     if output:
+        if output.startswith("PyNvVideoCodec "):
+            return output
         return f"{process_name} failed with exit code {returncode}:\n{output}"
+    if _is_windows_access_violation(returncode):
+        return (
+            "PyNvVideoCodec worker crashed while opening or processing this video. "
+            "The original file was kept and compression was skipped."
+        )
     if sys.platform == "win32":
         return f"{process_name} failed with exit code {returncode} (0x{returncode & 0xFFFFFFFF:08X})"
     return f"{process_name} failed with exit code {returncode}"
@@ -821,6 +833,11 @@ def _sanitize_process_output(output: str, *, max_lines: int = 12, max_chars: int
         return ""
 
     normalized_output = output.casefold()
+    if "timescale not set" in normalized_output:
+        return (
+            "PyNvVideoCodec could not read this MP4 stream timing metadata "
+            "(timescale not set). The original file was kept and compression was skipped."
+        )
     if "invalid data found when processing input" in normalized_output or "avformat_open_input" in normalized_output:
         return (
             "PyNvVideoCodec could not open the input video. "
@@ -842,6 +859,10 @@ def _sanitize_process_output(output: str, *, max_lines: int = 12, max_chars: int
 def _join_backend_errors(*errors: tuple[str, str]) -> str:
     formatted = [f"{backend}: {error}" for backend, error in errors if error]
     return "; ".join(formatted) or "All video compression backends failed"
+
+
+def _is_windows_access_violation(returncode: int) -> bool:
+    return (returncode & 0xFFFFFFFF) == 0xC0000005
 
 
 def _summarize_retry_errors(prefix: str, errors: list[str], *, max_errors: int = 3) -> str:

@@ -45,6 +45,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not hasattr(transcoder, "transcode_with_mux"):
             raise RuntimeError("PyNvVideoCodec transcoder does not expose transcode_with_mux")
         transcoder.transcode_with_mux()
+    except Exception as e:
+        _delete_outputs(output)
+        sys.stderr.write(f"{_format_exception(e, 'input')}\n")
+        return 1
+    finally:
+        del transcoder
+        gc.collect()
+
+    try:
         actual_output = _resolve_output(output)
         _validate_output(PyNvVideoCodec, str(actual_output), int(gpu_id))
         actual_output = _optimize_mp4_for_streaming(actual_output)
@@ -52,11 +61,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         _validate_output(PyNvVideoCodec, str(actual_output), int(gpu_id))
     except Exception as e:
         _delete_outputs(output)
-        sys.stderr.write(f"{_format_exception(e)}\n")
+        sys.stderr.write(f"{_format_exception(e, 'output')}\n")
         return 1
-    finally:
-        del transcoder
-        gc.collect()
     return 0
 
 
@@ -64,10 +70,17 @@ def _stringify_config(config: dict) -> dict[str, str]:
     return {key: str(value).lower() if isinstance(value, bool) else str(value) for key, value in config.items()}
 
 
-def _format_exception(error: Exception) -> str:
+def _format_exception(error: Exception, stage: str = "input") -> str:
     message = str(error).strip()
     normalized = message.casefold()
+    if "timescale not set" in normalized:
+        return (
+            "PyNvVideoCodec could not read this MP4 stream timing metadata "
+            "(timescale not set). The original file was kept and compression was skipped."
+        )
     if "invalid data found when processing input" in normalized or "avformat_open_input" in normalized:
+        if stage == "output":
+            return "PyNvVideoCodec created an invalid output video at this CQ"
         return (
             "PyNvVideoCodec could not open the input video. "
             "The file is unsupported, corrupted, incomplete, or not a real video container."

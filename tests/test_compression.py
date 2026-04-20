@@ -12,7 +12,12 @@ from PIL import Image
 
 from cyberdrop_dl.clients.download_client import DownloadClient
 from cyberdrop_dl.config.config_model import CompressionOptions, ConfigSettings
-from cyberdrop_dl.managers.compression_manager import CompressionManager, _sanitize_process_output
+from cyberdrop_dl.managers.compression_manager import (
+    CompressionManager,
+    CompressionResult,
+    _format_process_failure,
+    _sanitize_process_output,
+)
 from cyberdrop_dl.utils import yaml
 from cyberdrop_dl.utils.pynv_transcode_worker import (
     _candidate_outputs_for_cleanup,
@@ -236,11 +241,32 @@ Error Type : avformat_open_input(&ctx, szFilePath, NULL, NULL) returned error " 
         "PyNvVideoCodec could not open the input video. "
         "The file is unsupported, corrupted, incomplete, or not a real video container."
     )
+    assert _format_exception(RuntimeError("Invalid data found when processing input"), "output") == (
+        "PyNvVideoCodec created an invalid output video at this CQ"
+    )
     assert _sanitize_process_output(traceback_output) == (
         "PyNvVideoCodec could not open the input video. "
         "The file is unsupported, corrupted, incomplete, or not a real video container."
     )
     assert compression_manager._should_retry_with_higher_cq(traceback_output, 23) is False
+    assert compression_manager._should_retry_with_higher_cq(
+        "PyNvVideoCodec created an invalid output video at this CQ",
+        23,
+    )
+
+    timescale_output = "[mov,mp4,m4a,3gp,3g2,mj2 @ 000001C6C0394040] stream 0, timescale not set"
+    assert _format_exception(RuntimeError(timescale_output)) == (
+        "PyNvVideoCodec could not read this MP4 stream timing metadata "
+        "(timescale not set). The original file was kept and compression was skipped."
+    )
+    assert _format_process_failure("PyNvVideoCodec", 3221225477, timescale_output) == (
+        "PyNvVideoCodec could not read this MP4 stream timing metadata "
+        "(timescale not set). The original file was kept and compression was skipped."
+    )
+    assert _format_process_failure("PyNvVideoCodec", 3221225477, "") == (
+        "PyNvVideoCodec worker crashed while opening or processing this video. "
+        "The original file was kept and compression was skipped."
+    )
 
 
 def test_pynv_encoder_kwargs_use_gpu_buffers_constqp_and_b_frames() -> None:
@@ -616,6 +642,39 @@ def test_image_threshold_accepts_any_smaller_file_while_video_keeps_minimum_savi
         assert video_result.status == "skipped"
         assert video_result.error == "Compressed output was not small enough"
         assert source.stat().st_size == 100
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_compression_report_write_failure_does_not_fail_compression() -> None:
+    root = _reset_test_dir()
+    try:
+        video = root / "video.mp4"
+        video.write_bytes(b"x" * 100)
+
+        class FailingLogManager:
+            async def write_compression_report(self, **kwargs: Any) -> None:
+                raise PermissionError("locked")
+
+        owner = FakeCompressionOwner()
+        owner.log_manager = FailingLogManager()
+        compression_manager = CompressionManager(cast("Any", owner))
+
+        asyncio.run(
+            compression_manager._record_result(
+                _media_item(video),
+                CompressionResult(
+                    status="compressed",
+                    media_type="video",
+                    backend="pynv",
+                    path=video,
+                    original_size=100,
+                    final_size=50,
+                ),
+            )
+        )
+
+        assert owner.progress_manager.results == [("compressed", 50)]
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
