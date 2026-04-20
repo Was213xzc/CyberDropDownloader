@@ -23,6 +23,7 @@ dependencies = [
     "psutil >=7.2.1",
     "pycares >=4.10.0",
     "pycryptodome >=3.23.0",
+    "PyNvVideoCodec >=2.0.2",
     "pydantic >=2.12.4",
     "pyyaml >=6.0.3",
     "rich >=14.2.0",
@@ -69,7 +70,7 @@ test = [
 
 [project.optional-dependencies]
 compression = [
-    "PyNvVideoCodec >=2.1"
+    "PyNvVideoCodec >=2.0.2"
 ]
 
 [tool.coverage.report]

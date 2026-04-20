@@ -128,6 +128,36 @@ def test_pynv_encoder_kwargs_use_gpu_buffers_constqp_and_b_frames() -> None:
     assert "gpu_id" not in hevc_kwargs
 
 
+def test_pynv_transcode_uses_installed_transcoder_api_shape() -> None:
+    calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+    class FakeTranscoder:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            calls.append(("init", args, kwargs))
+
+        def transcode_with_mux(self) -> None:
+            calls.append(("transcode_with_mux", (), {}))
+
+    fake_pynv = SimpleNamespace(Transcoder=FakeTranscoder)
+    compression_manager = CompressionManager(cast("Any", FakeCompressionOwner()))
+    source = Path("input.mp4")
+    output = Path("output.mp4")
+
+    compression_manager._transcode_with_pynv(cast("Any", fake_pynv), source, output, 1, "hevc", 23)
+
+    assert calls[0][0] == "init"
+    assert calls[0][1] == ()
+    assert calls[0][2]["enc_file_path"] == str(source)
+    assert calls[0][2]["muxed_file_path"] == str(output)
+    assert calls[0][2]["gpu_id"] == 1
+    assert calls[0][2]["cuda_context"] == 0
+    assert calls[0][2]["cuda_stream"] == 0
+    assert calls[0][2]["codec"] == "hevc"
+    assert calls[0][2]["constqp"] == "23"
+    assert calls[0][2]["usedevicememory"] == "true"
+    assert calls[1] == ("transcode_with_mux", (), {})
+
+
 def test_video_slots_allow_at_most_two_jobs_per_gpu() -> None:
     owner = FakeCompressionOwner(CompressionOptions(gpu_ids=[0, 1], video_workers_per_gpu=2))
     compression_manager = CompressionManager(cast("Any", owner))

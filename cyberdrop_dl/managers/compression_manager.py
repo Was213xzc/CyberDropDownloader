@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import importlib
+import json
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -101,15 +104,12 @@ class CompressionManager:
             return CompressionResult(status="skipped", error="PyNvVideoCodec is not installed", **result_kwargs)
 
         try:
-            probe = await ffmpeg.probe(source)
-            video = probe.video
-            if not probe or video is None:
-                return CompressionResult(status="skipped", error="No video stream found", **result_kwargs)
-            if self._already_target_codec(video.codec, codec):
-                return CompressionResult(status="skipped", error=f"Already encoded as {codec}", **result_kwargs)
-            duration = float(video.duration or probe.format.duration or 0)
-            if duration <= 0:
-                return CompressionResult(status="skipped", error="Could not determine video duration", **result_kwargs)
+            if probe := await self._probe_if_available(source):
+                video = probe.video
+                if video is None:
+                    return CompressionResult(status="skipped", error="No video stream found", **result_kwargs)
+                if self._already_target_codec(video.codec, codec):
+                    return CompressionResult(status="skipped", error=f"Already encoded as {codec}", **result_kwargs)
 
             gpu_id = self._next_gpu_id()
             result_kwargs["gpu_id"] = gpu_id
@@ -117,16 +117,7 @@ class CompressionManager:
             await self._delete_temp(temp_output)
             try:
                 async with self._video_slot(gpu_id):
-                    await asyncio.to_thread(
-                        self._transcode_with_pynv,
-                        pynv,
-                        source,
-                        temp_output,
-                        duration,
-                        gpu_id,
-                        codec,
-                        cq,
-                    )
+                    await self._transcode_with_pynv_subprocess(source, temp_output, gpu_id, codec, cq)
             except Exception as e:
                 await self._delete_temp(temp_output)
                 return CompressionResult(status="skipped", error=str(e), **result_kwargs)
@@ -211,13 +202,22 @@ class CompressionManager:
             await self._delete_temp(temp_output)
             return CompressionResult(status="skipped", error="Compressed output was not small enough", **result_kwargs)
 
-        await asyncio.to_thread(temp_output.replace, source)
+        await self._replace_temp(temp_output, source)
         return CompressionResult(status="compressed", **result_kwargs)
 
+    async def _probe_if_available(self, source: Path):
+        if ffmpeg.get_ffprobe_version() is None:
+            return None
+        return await ffmpeg.probe(source)
+
     async def _validate_video(self, path: Path) -> None:
-        probe = await ffmpeg.probe(path)
-        if not probe or probe.video is None:
-            raise ValueError("Compressed video failed validation")
+        if probe := await self._probe_if_available(path):
+            if probe.video is None:
+                raise ValueError("Compressed video failed validation")
+            return
+
+        if not await asyncio.to_thread(lambda: path.is_file() and path.stat().st_size > 0):
+            raise ValueError("Compressed video output is empty")
 
     def _validate_image(self, path: Path) -> None:
         from PIL import Image
@@ -225,37 +225,73 @@ class CompressionManager:
         with Image.open(path) as image:
             image.verify()
 
+    async def _transcode_with_pynv_subprocess(
+        self,
+        source: Path,
+        temp_output: Path,
+        gpu_id: int,
+        codec: str,
+        cq: int,
+    ) -> None:
+        config_json = json.dumps(self._pynv_transcode_kwargs(codec, cq))
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "cyberdrop_dl.utils.pynv_transcode_worker",
+            str(source),
+            str(temp_output),
+            str(gpu_id),
+            config_json,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode:
+            output = (stderr or stdout).decode("utf8", errors="replace").strip()
+            raise RuntimeError(output or f"PyNvVideoCodec transcode failed with exit code {process.returncode}")
+
     def _transcode_with_pynv(
         self,
         pynv: ModuleType,
         source: Path,
         temp_output: Path,
-        duration: float,
         gpu_id: int,
         codec: str,
         cq: int,
     ) -> None:
-        transcode_kwargs = self._pynv_transcode_kwargs(codec, cq)
+        transcode_kwargs = self._stringify_pynv_kwargs(self._pynv_transcode_kwargs(codec, cq))
         factory = getattr(pynv, "Transcoder", None) or getattr(pynv, "CreateTranscoder", None)
         if factory is None:
             raise RuntimeError("PyNvVideoCodec Transcoder API is unavailable")
 
+        transcoder = None
         try:
-            transcoder = factory(
-                enc_file_path=str(source),
-                muxed_file_path=str(temp_output),
-                gpu_id=gpu_id,
-                **transcode_kwargs,
-            )
-        except TypeError:
-            transcoder = factory(str(source), str(temp_output), gpu_id, **transcode_kwargs)
+            try:
+                transcoder = factory(
+                    enc_file_path=str(source),
+                    muxed_file_path=str(temp_output),
+                    gpu_id=gpu_id,
+                    cuda_context=0,
+                    cuda_stream=0,
+                    **transcode_kwargs,
+                )
+            except TypeError:
+                if getattr(pynv, "Transcoder", None) is not None:
+                    transcoder = factory(str(source), str(temp_output), gpu_id, 0, 0, **transcode_kwargs)
+                else:
+                    transcoder = factory(str(source), str(temp_output), gpu_id, 0, 0, transcode_kwargs)
 
-        if hasattr(transcoder, "transcode"):
-            transcoder.transcode()
-        elif hasattr(transcoder, "segmented_transcode"):
-            transcoder.segmented_transcode(0.0, duration)
-        else:
-            raise RuntimeError("PyNvVideoCodec transcoder does not expose a transcode method")
+            if hasattr(transcoder, "transcode_with_mux"):
+                transcoder.transcode_with_mux()
+            elif hasattr(transcoder, "transcode"):
+                transcoder.transcode()
+            elif hasattr(transcoder, "segmented_transcode"):
+                raise RuntimeError("PyNvVideoCodec transcoder only exposes segmented_transcode")
+            else:
+                raise RuntimeError("PyNvVideoCodec transcoder does not expose a transcode method")
+        finally:
+            del transcoder
+            gc.collect()
 
     def _pynv_transcode_kwargs(self, codec: str, cq: int) -> dict:
         options = self.options
@@ -270,6 +306,9 @@ class CompressionManager:
             "preset": options.preset,
             "tuning_info": options.tuning_info,
         }
+
+    def _stringify_pynv_kwargs(self, kwargs: dict) -> dict[str, str]:
+        return {key: str(value).lower() if isinstance(value, bool) else str(value) for key, value in kwargs.items()}
 
     def _resolve_pynv_output(self, source: Path, temp_output: Path) -> Path:
         if temp_output.is_file():
@@ -339,5 +378,24 @@ class CompressionManager:
     def _video_slot(self, gpu_id: int) -> asyncio.BoundedSemaphore:
         return self._video_semaphores[gpu_id]
 
+    async def _replace_temp(self, temp_output: Path, source: Path) -> None:
+        for attempt in range(10):
+            try:
+                await asyncio.to_thread(temp_output.replace, source)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                gc.collect()
+                await asyncio.sleep(0.25)
+
     async def _delete_temp(self, temp_output: Path) -> None:
-        await asyncio.to_thread(temp_output.unlink, missing_ok=True)
+        for attempt in range(10):
+            try:
+                await asyncio.to_thread(temp_output.unlink, missing_ok=True)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                gc.collect()
+                await asyncio.sleep(0.25)
