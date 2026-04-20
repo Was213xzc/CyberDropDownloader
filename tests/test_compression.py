@@ -13,6 +13,7 @@ from cyberdrop_dl.clients.download_client import DownloadClient
 from cyberdrop_dl.config.config_model import CompressionOptions, ConfigSettings
 from cyberdrop_dl.managers.compression_manager import CompressionManager
 from cyberdrop_dl.utils import yaml
+from cyberdrop_dl.utils.pynv_transcode_worker import _resolve_output, _stringify_config
 
 if TYPE_CHECKING:
     from cyberdrop_dl.data_structures.url_objects import MediaItem
@@ -126,6 +127,22 @@ def test_pynv_encoder_kwargs_use_gpu_buffers_constqp_and_b_frames() -> None:
     assert hevc_kwargs["preset"] == "P6"
     assert hevc_kwargs["tuning_info"] == "high_quality"
     assert "gpu_id" not in hevc_kwargs
+
+
+def test_pynv_worker_stringifies_config_and_resolves_segment_output() -> None:
+    root = _reset_test_dir()
+    try:
+        expected_output = root / "video.compressed.mp4"
+        segmented_output = root / "video.compressed_0.000000_4.404400.mp4"
+        segmented_output.write_bytes(b"compressed")
+
+        assert _stringify_config({"constqp": 23, "usedevicememory": True}) == {
+            "constqp": "23",
+            "usedevicememory": "true",
+        }
+        assert _resolve_output(str(expected_output)) == segmented_output
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_pynv_transcode_uses_installed_transcoder_api_shape() -> None:

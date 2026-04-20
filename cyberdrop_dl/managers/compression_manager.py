@@ -392,10 +392,16 @@ class CompressionManager:
     async def _delete_temp(self, temp_output: Path) -> None:
         for attempt in range(10):
             try:
-                await asyncio.to_thread(temp_output.unlink, missing_ok=True)
+                await asyncio.to_thread(self._delete_temp_outputs, temp_output)
                 return
             except PermissionError:
                 if attempt == 9:
                     raise
                 gc.collect()
                 await asyncio.sleep(0.25)
+
+    def _delete_temp_outputs(self, temp_output: Path) -> None:
+        temp_output.unlink(missing_ok=True)
+        for path in temp_output.parent.glob(f"{temp_output.stem}*{temp_output.suffix}"):
+            if path != temp_output:
+                path.unlink(missing_ok=True)
