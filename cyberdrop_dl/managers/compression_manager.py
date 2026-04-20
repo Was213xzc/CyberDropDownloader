@@ -4,6 +4,7 @@ import asyncio
 import gc
 import importlib
 import json
+import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -234,6 +235,13 @@ class CompressionManager:
         cq: int,
     ) -> None:
         config_json = json.dumps(self._pynv_transcode_kwargs(codec, cq))
+        _suppress_windows_error_dialogs()
+        kwargs = {
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
@@ -242,13 +250,12 @@ class CompressionManager:
             str(temp_output),
             str(gpu_id),
             config_json,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            **kwargs,
         )
         stdout, stderr = await process.communicate()
         if process.returncode:
             output = (stderr or stdout).decode("utf8", errors="replace").strip()
-            raise RuntimeError(output or f"PyNvVideoCodec transcode failed with exit code {process.returncode}")
+            raise RuntimeError(_format_worker_failure(process.returncode, output))
 
     def _transcode_with_pynv(
         self,
@@ -407,3 +414,25 @@ class CompressionManager:
         for path in temp_output.parent.glob(f"{temp_output.stem}*{temp_output.suffix}"):
             if path != temp_output:
                 path.unlink(missing_ok=True)
+
+
+def _format_worker_failure(returncode: int, output: str) -> str:
+    if output:
+        return output
+    if sys.platform == "win32":
+        return f"PyNvVideoCodec worker failed with exit code {returncode} (0x{returncode & 0xFFFFFFFF:08X})"
+    return f"PyNvVideoCodec worker failed with exit code {returncode}"
+
+
+def _suppress_windows_error_dialogs() -> None:
+    if sys.platform != "win32":
+        return
+
+    import ctypes
+
+    sem_failcriticalerrors = 0x0001
+    sem_nogpfault_errorbox = 0x0002
+    sem_noopenfile_errorbox = 0x8000
+    ctypes.windll.kernel32.SetErrorMode(
+        sem_failcriticalerrors | sem_nogpfault_errorbox | sem_noopenfile_errorbox
+    )

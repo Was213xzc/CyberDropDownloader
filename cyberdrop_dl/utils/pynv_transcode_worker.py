@@ -10,6 +10,23 @@ if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
 
+def _suppress_windows_error_dialogs() -> None:
+    if sys.platform != "win32":
+        return
+
+    import ctypes
+
+    sem_failcriticalerrors = 0x0001
+    sem_nogpfault_errorbox = 0x0002
+    sem_noopenfile_errorbox = 0x8000
+    ctypes.windll.kernel32.SetErrorMode(
+        sem_failcriticalerrors | sem_nogpfault_errorbox | sem_noopenfile_errorbox
+    )
+
+
+_suppress_windows_error_dialogs()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     argv = argv or sys.argv[1:]
     if len(argv) != 4:

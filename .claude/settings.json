@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -NoProfile -Command \"Get-AppxPackage *HEVC* | Select-Object Name, PackageFullName, Architecture | Format-List\")"
+    ]
+  }
+}
