@@ -28,6 +28,7 @@ class LogManager:
         self.unsupported_urls_log: Path = manager.path_manager.unsupported_urls_log
         self.download_error_log: Path = manager.path_manager.download_error_urls_log
         self.scrape_error_log: Path = manager.path_manager.scrape_error_urls_log
+        self.skipped_duplicate_urls_log: Path = manager.path_manager.skipped_duplicate_urls_log
         self.jsonl_file = self.main_log.with_suffix(".results.jsonl")
         self._file_locks: dict[Path, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._has_headers: set[Path] = set()
@@ -59,6 +60,16 @@ class LogManager:
 
             await asyncio.to_thread(write)
 
+    async def _write_to_urls_txt(self, file: Path, url: URL) -> None:
+        """Write a URL-only text file that can be used as a future input file."""
+        async with self._file_locks[file]:
+
+            def write():
+                with file.open("a", encoding="utf8") as urls_file:
+                    urls_file.write(f"{url}\n")
+
+            await asyncio.to_thread(write)
+
     def write_last_post_log(self, url: URL) -> None:
         """Writes to the last post log."""
         self.manager.task_group.create_task(self._write_to_csv(self.last_post_log, url=url))
@@ -78,6 +89,12 @@ class LogManager:
                 referer=media_item.referer,
                 origin=origin,
             )
+        )
+
+    def write_skipped_duplicate_url_log(self, media_item: MediaItem) -> None:
+        """Writes duplicate-skipped source URLs to a reusable URLs.txt-style file."""
+        self.manager.task_group.create_task(
+            self._write_to_urls_txt(self.skipped_duplicate_urls_log, media_item.referer or media_item.url)
         )
 
     def write_scrape_error_log(self, url: URL | str, error_message: str, origin: URL | Path | None = None) -> None:

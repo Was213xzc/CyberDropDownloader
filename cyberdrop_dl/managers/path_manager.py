@@ -41,6 +41,7 @@ class PathManager:
         self.unsupported_urls_log: Path = field(init=False)
         self.download_error_urls_log: Path = field(init=False)
         self.scrape_error_urls_log: Path = field(init=False)
+        self.skipped_duplicate_urls_log: Path = field(init=False)
         self.pages_folder: Path = field(init=False)
 
         self._logs_model_names = [
@@ -134,6 +135,7 @@ class PathManager:
             setattr(self, internal_name, self.log_folder / getattr(log_settings_config, model_name))
 
         self.pages_folder = self.main_log.parent / "cdl_responses"
+        self.skipped_duplicate_urls_log = self.main_log.parent / "Skipped_Duplicate_URLs.txt"
 
     def _delete_logs_and_folders(self, now: datetime):
         if self.manager.config_manager.settings_data.logs.logs_expire_after:

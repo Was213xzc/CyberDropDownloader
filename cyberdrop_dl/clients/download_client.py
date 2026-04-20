@@ -156,6 +156,7 @@ class DownloadClient:
                     10,
                 )
                 self.manager.progress_manager.download_progress.add_previously_completed(False)
+                self.manager.log_manager.write_skipped_duplicate_url_log(media_item)
                 await self.process_completed(media_item, domain)
                 await self.handle_media_item_completion(media_item, downloaded=False)
                 return False
