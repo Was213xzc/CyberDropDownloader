@@ -338,10 +338,65 @@ class CompressionManager:
             config_json,
             **kwargs,
         )
-        stdout, stderr = await process.communicate()
+        max_output_size = await asyncio.to_thread(self._max_acceptable_output_size, source)
+        communicate_task = asyncio.create_task(process.communicate())
+        try:
+            while not communicate_task.done():
+                await asyncio.sleep(1)
+                oversized_output = await asyncio.to_thread(
+                    self._get_oversized_temp_output,
+                    temp_output,
+                    max_output_size,
+                )
+                if oversized_output is None:
+                    continue
+
+                await self._terminate_process(process)
+                stdout, stderr = await communicate_task
+                output = (stderr or stdout).decode("utf8", errors="replace").strip()
+                name, size = oversized_output
+                msg = (
+                    f"PyNvVideoCodec output exceeded safe size limit for {source.name}: "
+                    f"{name} reached {size:,} bytes, limit is {max_output_size:,} bytes"
+                )
+                if output:
+                    msg = f"{msg}\n{output}"
+                raise RuntimeError(msg)
+            stdout, stderr = await communicate_task
+        except Exception:
+            if process.returncode is None:
+                await self._terminate_process(process)
+            raise
         if process.returncode:
             output = (stderr or stdout).decode("utf8", errors="replace").strip()
             raise RuntimeError(_format_worker_failure(process.returncode, output))
+
+    def _max_acceptable_output_size(self, source: Path) -> int:
+        source_size = source.stat().st_size
+        threshold = 1 - (self.options.min_savings_percent / 100)
+        return max(1, int(source_size * threshold))
+
+    def _get_oversized_temp_output(self, temp_output: Path, max_output_size: int) -> tuple[str, int] | None:
+        for path in self._temp_output_cleanup_candidates(temp_output):
+            try:
+                size = path.stat().st_size
+            except FileNotFoundError:
+                continue
+            if size > max_output_size:
+                return path.name, size
+        return None
+
+    async def _terminate_process(self, process: asyncio.subprocess.Process) -> None:
+        if process.returncode is not None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
 
     def _transcode_with_pynv(
         self,

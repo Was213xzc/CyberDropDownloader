@@ -350,6 +350,29 @@ def test_video_slots_allow_at_most_two_jobs_per_gpu() -> None:
     assert peak_by_gpu == {0: 2, 1: 2}
 
 
+def test_video_temp_output_size_guard_stops_expanding_outputs() -> None:
+    root = _reset_test_dir()
+    try:
+        source = root / "video.mov"
+        temp_output = root / "video.compressed.mov"
+        timestamped_output = root / "video.compressed_0.000000_101.031670.mov"
+        faststart_output = timestamped_output.with_suffix(timestamped_output.suffix + ".faststart")
+        source.write_bytes(b"x" * 100)
+        temp_output.write_bytes(b"x" * 50)
+        timestamped_output.write_bytes(b"x" * 96)
+        faststart_output.write_bytes(b"x" * 120)
+
+        compression_manager = CompressionManager(cast("Any", FakeCompressionOwner(CompressionOptions())))
+
+        assert compression_manager._max_acceptable_output_size(source) == 95
+        assert compression_manager._get_oversized_temp_output(temp_output, 95) == (timestamped_output.name, 96)
+
+        timestamped_output.write_bytes(b"x" * 80)
+        assert compression_manager._get_oversized_temp_output(temp_output, 95) == (faststart_output.name, 120)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_resolve_pynv_timestamped_segment_output() -> None:
     root = _reset_test_dir()
     try:
