@@ -34,6 +34,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         gc.collect()
     actual_output = _resolve_output(output)
     _validate_output(PyNvVideoCodec, str(actual_output), int(gpu_id))
+    actual_output = _optimize_mp4_for_streaming(actual_output)
+    _validate_output(PyNvVideoCodec, str(actual_output), int(gpu_id))
     return 0
 
 
@@ -58,6 +60,138 @@ def _resolve_output(output: str) -> Path:
     if not candidates:
         raise RuntimeError("PyNvVideoCodec did not create an output file")
     return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def _optimize_mp4_for_streaming(path: Path) -> Path:
+    if path.suffix.casefold() not in {".mp4", ".m4v", ".mov"}:
+        return path
+
+    atoms = _read_top_level_atoms(path)
+    moov = next((atom for atom in atoms if atom.type == b"moov"), None)
+    first_mdat = next((atom for atom in atoms if atom.type == b"mdat"), None)
+    if moov is None or first_mdat is None or moov.offset < first_mdat.offset:
+        return path
+
+    with path.open("rb") as input_file:
+        input_file.seek(moov.offset)
+        patched_moov = _patch_moov_offsets(input_file.read(moov.size), moov.size)
+
+        faststart_path = path.with_suffix(path.suffix + ".faststart")
+        with faststart_path.open("wb") as output_file:
+            for atom in atoms:
+                if atom == moov:
+                    continue
+                if atom == first_mdat:
+                    output_file.write(patched_moov)
+                input_file.seek(atom.offset)
+                _copy_bytes(input_file, output_file, atom.size)
+
+    faststart_path.replace(path)
+    return path
+
+
+class _Mp4Atom:
+    def __init__(self, atom_type: bytes, offset: int, size: int) -> None:
+        self.type = atom_type
+        self.offset = offset
+        self.size = size
+
+
+def _read_top_level_atoms(path: Path) -> list[_Mp4Atom]:
+    atoms = []
+    file_size = path.stat().st_size
+    with path.open("rb") as input_file:
+        offset = 0
+        while offset + 8 <= file_size:
+            input_file.seek(offset)
+            header = input_file.read(16)
+            atom_size = int.from_bytes(header[0:4], "big")
+            atom_type = header[4:8]
+            header_size = 8
+            if atom_size == 1:
+                atom_size = int.from_bytes(header[8:16], "big")
+                header_size = 16
+            elif atom_size == 0:
+                atom_size = file_size - offset
+            if atom_size < header_size or offset + atom_size > file_size:
+                raise RuntimeError(f"Invalid MP4 atom {atom_type!r} at offset {offset}")
+            atoms.append(_Mp4Atom(atom_type, offset, atom_size))
+            offset += atom_size
+    return atoms
+
+
+def _patch_moov_offsets(moov: bytes, offset_adjustment: int) -> bytes:
+    patched = bytearray(moov)
+    _patch_child_offsets(patched, 8, len(patched), offset_adjustment)
+    return bytes(patched)
+
+
+_CONTAINER_ATOMS = {b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts", b"udta", b"dinf"}
+
+
+def _patch_child_offsets(data: bytearray, start: int, end: int, offset_adjustment: int) -> None:
+    position = start
+    while position + 8 <= end:
+        atom_size = int.from_bytes(data[position : position + 4], "big")
+        atom_type = bytes(data[position + 4 : position + 8])
+        header_size = 8
+        if atom_size == 1:
+            atom_size = int.from_bytes(data[position + 8 : position + 16], "big")
+            header_size = 16
+        elif atom_size == 0:
+            atom_size = end - position
+        if atom_size < header_size or position + atom_size > end:
+            return
+
+        content_start = position + header_size
+        atom_end = position + atom_size
+        if atom_type == b"stco":
+            _patch_stco(data, content_start, atom_end, offset_adjustment)
+        elif atom_type == b"co64":
+            _patch_co64(data, content_start, atom_end, offset_adjustment)
+        elif atom_type in _CONTAINER_ATOMS:
+            _patch_child_offsets(data, content_start, atom_end, offset_adjustment)
+        position = atom_end
+
+
+def _patch_stco(data: bytearray, content_start: int, atom_end: int, offset_adjustment: int) -> None:
+    entry_count_offset = content_start + 4
+    entries_start = content_start + 8
+    if entries_start > atom_end:
+        return
+    entry_count = int.from_bytes(data[entry_count_offset:entries_start], "big")
+    for index in range(entry_count):
+        entry_offset = entries_start + index * 4
+        if entry_offset + 4 > atom_end:
+            return
+        new_offset = int.from_bytes(data[entry_offset : entry_offset + 4], "big") + offset_adjustment
+        if new_offset > 0xFFFFFFFF:
+            raise RuntimeError("Cannot faststart MP4 because stco offsets overflow 32-bit range")
+        data[entry_offset : entry_offset + 4] = new_offset.to_bytes(4, "big")
+
+
+def _patch_co64(data: bytearray, content_start: int, atom_end: int, offset_adjustment: int) -> None:
+    entry_count_offset = content_start + 4
+    entries_start = content_start + 8
+    if entries_start > atom_end:
+        return
+    entry_count = int.from_bytes(data[entry_count_offset:entries_start], "big")
+    for index in range(entry_count):
+        entry_offset = entries_start + index * 8
+        if entry_offset + 8 > atom_end:
+            return
+        new_offset = int.from_bytes(data[entry_offset : entry_offset + 8], "big") + offset_adjustment
+        data[entry_offset : entry_offset + 8] = new_offset.to_bytes(8, "big")
+
+
+def _copy_bytes(input_file, output_file, count: int) -> None:
+    remaining = count
+    while remaining:
+        chunk = input_file.read(min(1024 * 1024, remaining))
+        if not chunk:
+            raise RuntimeError("Unexpected EOF while optimizing MP4 metadata")
+        output_file.write(chunk)
+        remaining -= len(chunk)
 
 
 def _get_duration(pynv_module, source: str, gpu_id: int) -> float:

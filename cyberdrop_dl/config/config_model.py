@@ -297,6 +297,8 @@ class CompressionOptions(BaseModel):
     hevc_cq: NonNegativeInt = 23
     av1_cq: NonNegativeInt = 26
     bf: NonNegativeInt = 3
+    gop: PositiveInt = 60
+    idrperiod: PositiveInt = 60
     preset: NonEmptyStr = "P6"
     tuning_info: NonEmptyStr = "high_quality"
     min_savings_percent: NonNegativeInt = 5

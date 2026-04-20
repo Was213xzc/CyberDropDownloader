@@ -303,6 +303,8 @@ class CompressionManager:
             "rc": "constqp",
             "constqp": cq,
             "bf": options.bf,
+            "gop": options.gop,
+            "idrperiod": options.idrperiod,
             "preset": options.preset,
             "tuning_info": options.tuning_info,
         }

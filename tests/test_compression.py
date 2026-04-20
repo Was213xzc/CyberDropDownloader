@@ -13,7 +13,7 @@ from cyberdrop_dl.clients.download_client import DownloadClient
 from cyberdrop_dl.config.config_model import CompressionOptions, ConfigSettings
 from cyberdrop_dl.managers.compression_manager import CompressionManager
 from cyberdrop_dl.utils import yaml
-from cyberdrop_dl.utils.pynv_transcode_worker import _resolve_output, _stringify_config
+from cyberdrop_dl.utils.pynv_transcode_worker import _optimize_mp4_for_streaming, _resolve_output, _stringify_config
 
 if TYPE_CHECKING:
     from cyberdrop_dl.data_structures.url_objects import MediaItem
@@ -76,6 +76,8 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert options.hevc_cq == 23
         assert options.av1_cq == 26
         assert options.bf == 3
+        assert options.gop == 60
+        assert options.idrperiod == 60
 
         assert CompressionOptions.model_validate({"video_workers_per_gpu": 99}).video_workers_per_gpu == 2
         assert CompressionOptions.model_validate({"video_workers_per_gpu": 0}).video_workers_per_gpu == 1
@@ -121,6 +123,8 @@ def test_pynv_encoder_kwargs_use_gpu_buffers_constqp_and_b_frames() -> None:
     assert av1_kwargs["codec"] == "av1"
     assert av1_kwargs["constqp"] == 26
     assert hevc_kwargs["bf"] == 3
+    assert hevc_kwargs["gop"] == 60
+    assert hevc_kwargs["idrperiod"] == 60
     assert hevc_kwargs["usedevicememory"] is True
     assert hevc_kwargs["usecpuinputbuffer"] is False
     assert hevc_kwargs["format"] == "NV12"
@@ -143,6 +147,33 @@ def test_pynv_worker_stringifies_config_and_resolves_segment_output() -> None:
         assert _resolve_output(str(expected_output)) == segmented_output
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_mp4_faststart_moves_moov_before_mdat_and_patches_offsets() -> None:
+    root = _reset_test_dir()
+    try:
+        video_path = root / "video.mp4"
+        original_chunk_offset = 100
+        stco = _mp4_atom(
+            b"stco",
+            b"\0\0\0\0" + (1).to_bytes(4, "big") + original_chunk_offset.to_bytes(4, "big"),
+        )
+        moov = _mp4_atom(b"moov", _mp4_atom(b"trak", _mp4_atom(b"mdia", _mp4_atom(b"minf", _mp4_atom(b"stbl", stco)))))
+        video_path.write_bytes(_mp4_atom(b"ftyp", b"isom\0\0\0\0") + _mp4_atom(b"mdat", b"x" * 10) + moov)
+
+        _optimize_mp4_for_streaming(video_path)
+
+        optimized = video_path.read_bytes()
+        assert optimized.find(b"moov") < optimized.find(b"mdat")
+        stco_type_offset = optimized.find(b"stco")
+        patched_offset = int.from_bytes(optimized[stco_type_offset + 12 : stco_type_offset + 16], "big")
+        assert patched_offset == original_chunk_offset + len(moov)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _mp4_atom(atom_type: bytes, payload: bytes) -> bytes:
+    return (len(payload) + 8).to_bytes(4, "big") + atom_type + payload
 
 
 def test_pynv_transcode_uses_installed_transcoder_api_shape() -> None:
