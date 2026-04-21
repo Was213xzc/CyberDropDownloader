@@ -418,6 +418,7 @@ class Crawler(ABC):
         *,
         custom_filename: str | None = None,
         debrid_link: AbsoluteHttpURL | None = None,
+        fallbacks: list[AbsoluteHttpURL] | None = None,
         m3u8: m3u8.RenditionGroup | None = None,
         metadata: object = None,
     ) -> None:
@@ -443,6 +444,7 @@ class Crawler(ABC):
             ext=ext,
         )
         media_item.debrid_link = debrid_link
+        media_item.fallbacks = fallbacks
         if metadata is not None:
             media_item.metadata = metadata
         await self.handle_media_item(media_item, m3u8)

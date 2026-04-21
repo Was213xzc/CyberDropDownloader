@@ -9,6 +9,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
 import aiofiles
+import aiohttp
 
 from cyberdrop_dl import constants
 from cyberdrop_dl.clients.response import AbstractResponse
@@ -25,8 +26,6 @@ if TYPE_CHECKING:
     from pathlib import Path
     from typing import Any
 
-    import aiohttp
-
     from cyberdrop_dl.data_structures.url_objects import MediaItem
     from cyberdrop_dl.managers.client_manager import ClientManager
     from cyberdrop_dl.managers.manager import Manager
@@ -39,7 +38,7 @@ _CHROME_ANDROID_USER_AGENT: str = (
 )
 _FREE_SPACE_CHECK_PERIOD: int = 5  # Check every 5 chunks
 _NULL_CONTEXT: contextlib.nullcontext[None] = contextlib.nullcontext()
-_USE_IMPERSONATION: set[str] = {"vsco", "celebforum"}
+_USE_IMPERSONATION: set[str] = {"vsco", "celebforum", "coomer"}
 
 
 class DownloadClient:
@@ -90,6 +89,12 @@ class DownloadClient:
             }
         elif domain == "megacloud":
             download_headers["Referer"] = "https://megacloud.blog/"
+        elif domain == "coomer":
+            download_headers |= {
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Origin": "https://coomer.st",
+            }
         return download_headers
 
     async def _download(self, domain: str, media_item: MediaItem) -> bool:
@@ -194,6 +199,7 @@ class DownloadClient:
         self, url: AbsoluteHttpURL, domain: str, headers: dict[str, str]
     ) -> AsyncGenerator[AbstractResponse | aiohttp.ClientResponse]:
         if domain in _USE_IMPERSONATION:
+            self.client_manager.check_curl_cffi_is_available()
             resp = await self.client_manager._curl_session.get(str(url), stream=True, headers=headers)
             try:
                 yield AbstractResponse.from_resp(resp)
@@ -237,6 +243,22 @@ class DownloadClient:
                     else:
                         fallback_count += 1
                         msg = f" with fallback URL #{fallback_count} {download_url} failed, retrying with new fallback URL: "
+                    log(f"Download of {media_item.url}{msg}{next_download_url}", 40)
+                    download_url = next_download_url
+                    continue
+                raise
+            except (aiohttp.ClientError, TimeoutError):
+                if next_download_url := _next_fallback_url_for_connection_error(fallback_url_generator):
+                    fallback_count += 1
+                    if media_item.debrid_link and media_item.debrid_link == download_url:
+                        msg = f" with debrid URL {download_url} failed to connect, retrying with fallback URL: "
+                    elif media_item.url == download_url:
+                        msg = " failed to connect, retrying with fallback URL: "
+                    else:
+                        msg = (
+                            f" with fallback URL #{fallback_count} {download_url} failed to connect, "
+                            f"retrying with new fallback URL: "
+                        )
                     log(f"Download of {media_item.url}{msg}{next_download_url}", 40)
                     download_url = next_download_url
                     continue
@@ -593,3 +615,11 @@ def _fallback_generator(media_item: MediaItem):
     gen = gen_fallback()
     _ = next(gen)
     return gen
+
+
+def _next_fallback_url_for_connection_error(
+    fallback_url_generator: Generator[AbsoluteHttpURL | None, aiohttp.ClientResponse, None],
+) -> AbsoluteHttpURL | None:
+    with contextlib.suppress(StopIteration):
+        return next(fallback_url_generator)
+    return None
