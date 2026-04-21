@@ -180,7 +180,7 @@ class Manager:
 
         conf = merge_models(self.config_manager.settings_data, self.parsed_args.config_settings)
         global_conf = merge_models(self.config_manager.global_settings_data, self.parsed_args.global_settings)
-        deep_scrape = self.parsed_args.config_settings.runtime_options.deep_scrape or self.config_manager.deep_scrape
+        deep_scrape = conf.runtime_options.deep_scrape
 
         self.config_manager.settings_data = conf
         self.config_manager.global_settings_data = global_conf

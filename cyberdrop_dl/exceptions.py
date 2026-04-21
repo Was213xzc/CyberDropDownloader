@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 from http import HTTPStatus
 from pathlib import Path
+import re
 from typing import TYPE_CHECKING
 
 from yaml import YAMLError
@@ -45,6 +46,17 @@ HTTP_ERROR_CODES = {
     **CLOUDFLARE_HTTP_ERROR_CODES,
     **{code.value: code.phrase for code in HTTPStatus},
 }
+
+CURL_ERROR_CODES = {
+    6: "DNS Error",
+    7: "Connection Failed",
+    28: "Timeout",
+    35: "SSL Handshake Failed",
+    56: "Connection Closed",
+    60: "SSL Certificate Error",
+}
+
+_CURL_ERROR_RE = re.compile(r"curl:\s*\((\d+)\)", re.IGNORECASE)
 
 
 class TooManyCrawlerErrors(Exception):  # noqa: N818
@@ -249,6 +261,18 @@ def get_origin(origin: ScrapeItem | Path | MediaItem | URL | None = None) -> Pat
     return origin
 
 
+def _classify_unknown_error(message: str) -> str | None:
+    if match := _CURL_ERROR_RE.search(message):
+        code = int(match.group(1))
+        return CURL_ERROR_CODES.get(code, f"cURL Error ({code})")
+
+    lowered = message.lower()
+    if "timed out" in lowered or "timeout" in lowered:
+        return "Timeout"
+
+    return None
+
+
 @dataclasses.dataclass(slots=True)
 class ErrorLogMessage:
     ui_failure: str
@@ -265,6 +289,7 @@ class ErrorLogMessage:
     def from_unknown_exc(e: Exception) -> ErrorLogMessage:
         e_status = getattr(e, "status", None)
         e_message = getattr(e, "message", None)
-        ui_failure = create_error_msg(e_status) if e_status else "Unknown"
-        log_msg = _format_error(ui_failure, e_message or str(e))
+        message = (e_message or str(e)).strip()
+        ui_failure = create_error_msg(e_status) if e_status else (_classify_unknown_error(message) or "Unknown")
+        log_msg = _format_error(ui_failure, message)
         return ErrorLogMessage(ui_failure, log_msg)

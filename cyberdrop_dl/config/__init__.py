@@ -22,7 +22,7 @@ __all__ = [
     "GlobalSettings",
 ]
 
-deep_scrape: bool = False
+deep_scrape: bool = True
 
 current_config: Config
 cli: ParsedArgs

@@ -29,7 +29,7 @@ class ConfigManager:
         self.authentication_settings: Path = field(init=False)
         self.settings: Path = field(init=False)
         self.global_settings: Path = field(init=False)
-        self.deep_scrape: bool = False
+        self.deep_scrape: bool = True
         self.apprise_urls: list[AppriseURL] = []
 
         self.authentication_data: AuthSettings = field(init=False)
@@ -104,11 +104,11 @@ class ConfigManager:
             self.settings_data = ConfigSettings.model_validate(yaml.load(self.settings))
             set_fields = self.get_model_fields(self.settings_data)
             self.deep_scrape = self.settings_data.runtime_options.deep_scrape
-            self.settings_data.runtime_options.deep_scrape = False
             if posible_fields == set_fields and not needs_update and self.pydantic_config:
                 return
         else:
             self.settings_data = ConfigSettings()
+            self.deep_scrape = self.settings_data.runtime_options.deep_scrape
             self.settings_data.files.input_file = (
                 self.manager.path_manager.appdata / "Configs" / self.loaded_config / "URLs.txt"
             )

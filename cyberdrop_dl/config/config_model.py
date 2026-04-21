@@ -179,7 +179,7 @@ class IgnoreOptions(BaseModel):
 
 class RuntimeOptions(BaseModel):
     console_log_level: NonNegativeInt = 100
-    deep_scrape: bool = False
+    deep_scrape: bool = True
     delete_partial_files: bool = False
     ignore_history: bool = False
     jdownloader_autostart: bool = False
