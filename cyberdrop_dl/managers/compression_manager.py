@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 CompressionStatus = Literal["compressed", "skipped", "failed"]
 MediaType = Literal["video", "image"]
 
+_COMPRESSED_MARKER = "[COMPRESSED] "
+
 
 @dataclass(slots=True, kw_only=True)
 class CompressionQueueItem:
@@ -178,6 +180,8 @@ class CompressionManager:
 
         if result.status == "compressed" and result.final_size is not None:
             media_item.filesize = result.final_size
+        if result.status == "compressed" and result.media_type == "video":
+            result.path = await self._apply_compressed_marker(media_item, result.path)
         await self._record_result(media_item, result)
         return result
 
@@ -509,6 +513,35 @@ class CompressionManager:
 
     def _video_slot(self, gpu_id: int) -> asyncio.BoundedSemaphore:
         return self._video_semaphores[gpu_id]
+
+    async def _apply_compressed_marker(self, media_item: MediaItem, source: Path) -> Path:
+        if source.name.startswith(_COMPRESSED_MARKER):
+            return source
+
+        candidate = source.with_name(_COMPRESSED_MARKER + source.name)
+        if await asyncio.to_thread(candidate.exists):
+            candidate = await asyncio.to_thread(self._next_available_marked_name, source)
+            if candidate is None:
+                log(f"Unable to apply [COMPRESSED] marker to {source}: no free filename", 30)
+                return source
+
+        try:
+            await asyncio.to_thread(source.rename, candidate)
+        except OSError as e:
+            log(f"Failed to apply [COMPRESSED] marker to {source}: {e}", 30)
+            return source
+
+        media_item.complete_file = candidate
+        media_item.download_filename = candidate.name
+        return candidate
+
+    def _next_available_marked_name(self, source: Path) -> Path | None:
+        stem, suffix = source.stem, source.suffix
+        for counter in range(1, 1000):
+            candidate = source.with_name(f"{_COMPRESSED_MARKER}{stem} ({counter}){suffix}")
+            if not candidate.exists():
+                return candidate
+        return None
 
     async def _replace_temp(self, temp_output: Path, source: Path) -> None:
         for attempt in range(10):

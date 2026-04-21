@@ -57,6 +57,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         actual_output = _resolve_output(output)
         actual_output = _optimize_mp4_for_streaming(actual_output)
+        _repair_sample_entry_for_target_codec(actual_output, str(config.get("codec", "")))
         _retag_hevc_sample_entries(actual_output)
         _validate_output(PyNvVideoCodec, str(actual_output), int(gpu_id))
     except Exception as e:
@@ -209,6 +210,204 @@ def _walk_sample_entries_for_hev1(data: bytes, start: int, end: int) -> Iterator
         if bytes(data[position + 4 : position + 8]) == b"hev1":
             yield position + 4
         position += entry_size
+
+
+_HEVC_CODEC_NAMES = {"hevc", "h265"}
+_AVC1_CONTAINER_ATOMS = {b"moov", b"trak", b"mdia", b"minf", b"stbl"}
+
+
+def _repair_sample_entry_for_target_codec(path: Path, target_codec: str) -> None:
+    if _normalize_codec_name(target_codec) not in _HEVC_CODEC_NAMES:
+        return
+    if path.suffix.casefold() not in {".mp4", ".m4v", ".mov"}:
+        return
+
+    atoms = _read_top_level_atoms(path)
+    moov = next((atom for atom in atoms if atom.type == b"moov"), None)
+    mdat = next((atom for atom in atoms if atom.type == b"mdat"), None)
+    if moov is None or mdat is None:
+        return
+
+    with path.open("rb") as input_file:
+        input_file.seek(moov.offset)
+        moov_bytes = bytearray(input_file.read(moov.size))
+        input_file.seek(mdat.offset + 8)
+        mdat_head = input_file.read(min(mdat.size - 8, 1024 * 1024))
+
+    info = _find_avc1_sample_entry(moov_bytes)
+    if info is None:
+        return
+    sample_entry_offset, _entry_size, avcc_offset, avcc_size, ancestor_offsets = info
+
+    if avcc_size > 16:
+        return
+
+    vps, sps, pps = _extract_inline_hevc_param_sets(mdat_head)
+    if not (vps and sps and pps):
+        return
+
+    hvcc_body = _build_hvcc_body(vps, sps, pps)
+    hvcc_atom = (8 + len(hvcc_body)).to_bytes(4, "big") + b"hvcC" + hvcc_body
+    size_delta = len(hvcc_atom) - avcc_size
+
+    moov_bytes[sample_entry_offset + 4 : sample_entry_offset + 8] = b"hvc1"
+    new_moov = bytearray(
+        bytes(moov_bytes[:avcc_offset]) + hvcc_atom + bytes(moov_bytes[avcc_offset + avcc_size :])
+    )
+
+    for bump_offset in [*ancestor_offsets, sample_entry_offset]:
+        current = int.from_bytes(new_moov[bump_offset : bump_offset + 4], "big")
+        new_moov[bump_offset : bump_offset + 4] = (current + size_delta).to_bytes(4, "big")
+
+    if moov.offset < mdat.offset:
+        _patch_child_offsets(new_moov, 8, len(new_moov), size_delta)
+
+    repair_path = path.with_suffix(path.suffix + ".repair")
+    try:
+        with path.open("rb") as input_file, repair_path.open("wb") as output_file:
+            for atom in atoms:
+                if atom is moov:
+                    output_file.write(bytes(new_moov))
+                else:
+                    input_file.seek(atom.offset)
+                    _copy_bytes(input_file, output_file, atom.size)
+        repair_path.replace(path)
+    except Exception:
+        repair_path.unlink(missing_ok=True)
+        raise
+
+
+def _normalize_codec_name(codec: str) -> str:
+    return codec.casefold().replace(".", "").replace("-", "").replace("_", "")
+
+
+def _find_avc1_sample_entry(
+    moov_bytes: bytes,
+) -> tuple[int, int, int, int, list[int]] | None:
+    return _walk_for_avc1(moov_bytes, 8, len(moov_bytes), [0])
+
+
+def _walk_for_avc1(
+    data: bytes, start: int, end: int, ancestor_offsets: list[int]
+) -> tuple[int, int, int, int, list[int]] | None:
+    position = start
+    while position + 8 <= end:
+        atom_size = int.from_bytes(data[position : position + 4], "big")
+        atom_type = bytes(data[position + 4 : position + 8])
+        header_size = 8
+        if atom_size == 1:
+            atom_size = int.from_bytes(data[position + 8 : position + 16], "big")
+            header_size = 16
+        elif atom_size == 0:
+            atom_size = end - position
+        if atom_size < header_size or position + atom_size > end:
+            return None
+        content_start = position + header_size
+        atom_end = position + atom_size
+        if atom_type == b"stsd":
+            result = _find_avc1_in_stsd(data, content_start + 8, atom_end)
+            if result is not None:
+                entry_offset, entry_size, avcc_offset, avcc_size = result
+                return entry_offset, entry_size, avcc_offset, avcc_size, [*ancestor_offsets, position]
+        elif atom_type in _AVC1_CONTAINER_ATOMS:
+            nested = _walk_for_avc1(data, content_start, atom_end, [*ancestor_offsets, position])
+            if nested is not None:
+                return nested
+        position = atom_end
+    return None
+
+
+def _find_avc1_in_stsd(
+    data: bytes, start: int, end: int
+) -> tuple[int, int, int, int] | None:
+    position = start
+    while position + 8 <= end:
+        entry_size = int.from_bytes(data[position : position + 4], "big")
+        if entry_size < 8 or position + entry_size > end:
+            return None
+        entry_type = bytes(data[position + 4 : position + 8])
+        entry_end = position + entry_size
+        if entry_type == b"avc1":
+            avcc = _find_child_atom(data, position + 8 + 78, entry_end, b"avcC")
+            if avcc is not None:
+                avcc_offset, avcc_size = avcc
+                return position, entry_size, avcc_offset, avcc_size
+            return position, entry_size, entry_end, 0
+        position += entry_size
+    return None
+
+
+def _find_child_atom(
+    data: bytes, start: int, end: int, target: bytes
+) -> tuple[int, int] | None:
+    position = start
+    while position + 8 <= end:
+        atom_size = int.from_bytes(data[position : position + 4], "big")
+        atom_type = bytes(data[position + 4 : position + 8])
+        if atom_size < 8 or position + atom_size > end:
+            return None
+        if atom_type == target:
+            return position, atom_size
+        position += atom_size
+    return None
+
+
+def _extract_inline_hevc_param_sets(
+    data: bytes,
+) -> tuple[bytes | None, bytes | None, bytes | None]:
+    vps: bytes | None = None
+    sps: bytes | None = None
+    pps: bytes | None = None
+    position = 0
+    for _ in range(32):
+        if position + 4 > len(data):
+            break
+        nal_size = int.from_bytes(data[position : position + 4], "big")
+        position += 4
+        if nal_size <= 0 or position + nal_size > len(data):
+            break
+        nal = data[position : position + nal_size]
+        position += nal_size
+        if len(nal) < 2:
+            continue
+        nal_type = (nal[0] >> 1) & 0x3F
+        if nal_type == 32 and vps is None:
+            vps = bytes(nal)
+        elif nal_type == 33 and sps is None:
+            sps = bytes(nal)
+        elif nal_type == 34 and pps is None:
+            pps = bytes(nal)
+        elif nal_type < 32:
+            break
+        if vps and sps and pps:
+            break
+    return vps, sps, pps
+
+
+def _build_hvcc_body(vps: bytes, sps: bytes, pps: bytes) -> bytes:
+    if len(sps) < 15:
+        raise RuntimeError("HEVC SPS too short to derive profile_tier_level")
+
+    num_temporal_layers = ((sps[2] >> 1) & 0x07) + 1
+    temporal_id_nested = sps[2] & 0x01
+
+    body = bytearray()
+    body.append(1)
+    body.extend(sps[3:15])
+    body.extend(b"\xf0\x00")
+    body.append(0xFC)
+    body.append(0xFD)
+    body.append(0xF8)
+    body.append(0xF8)
+    body.extend(b"\x00\x00")
+    body.append(((num_temporal_layers & 0x07) << 3) | ((temporal_id_nested & 0x01) << 2) | 0x03)
+    body.append(3)
+    for nal_type, nal in ((32, vps), (33, sps), (34, pps)):
+        body.append(nal_type)
+        body.extend(b"\x00\x01")
+        body.extend(len(nal).to_bytes(2, "big"))
+        body.extend(nal)
+    return bytes(body)
 
 
 class _Mp4Atom:

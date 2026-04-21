@@ -19,9 +19,12 @@ from cyberdrop_dl.managers.compression_manager import (
 )
 from cyberdrop_dl.utils import yaml
 from cyberdrop_dl.utils.pynv_transcode_worker import (
+    _build_hvcc_body,
     _candidate_outputs_for_cleanup,
+    _extract_inline_hevc_param_sets,
     _format_exception,
     _optimize_mp4_for_streaming,
+    _repair_sample_entry_for_target_codec,
     _resolve_output,
     _retag_hevc_sample_entries,
     _stringify_config,
@@ -418,6 +421,208 @@ def test_retag_hevc_sample_entries_skips_non_hevc_streams_and_non_mp4_files() ->
         mkv_path.write_bytes(mkv_bytes)
         _retag_hevc_sample_entries(mkv_path)
         assert mkv_path.read_bytes() == mkv_bytes
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_repair_sample_entry_converts_empty_avc1_to_hvc1_for_hevc_bitstream() -> None:
+    root = _reset_test_dir()
+    try:
+        video_path = root / "video.mp4"
+        empty_avcC = _mp4_atom(b"avcC", b"")
+        sample_entry_payload = (
+            b"\x00" * 6
+            + b"\x00\x01"
+            + b"\x00" * 16
+            + b"\x00\x80"
+            + b"\x00\x80"
+            + b"\x00\x48\x00\x00"
+            + b"\x00\x48\x00\x00"
+            + b"\x00\x00\x00\x00"
+            + b"\x00\x01"
+            + b"\x00" * 32
+            + b"\x00\x18"
+            + b"\xff\xff"
+            + empty_avcC
+        )
+        avc1 = _mp4_atom(b"avc1", sample_entry_payload)
+        stsd = _mp4_atom(b"stsd", b"\x00\x00\x00\x00" + (1).to_bytes(4, "big") + avc1)
+        moov = _mp4_atom(
+            b"moov",
+            _mp4_atom(b"trak", _mp4_atom(b"mdia", _mp4_atom(b"minf", _mp4_atom(b"stbl", stsd)))),
+        )
+
+        vps_nal = bytes([(32 << 1), 0x01]) + b"\x00" * 8
+        sps_nal = bytes([(33 << 1), 0x01]) + b"\x00" * 15
+        pps_nal = bytes([(34 << 1), 0x01]) + b"\x00" * 4
+        mdat_body = b""
+        for nal in (vps_nal, sps_nal, pps_nal):
+            mdat_body += len(nal).to_bytes(4, "big") + nal
+        mdat = _mp4_atom(b"mdat", mdat_body)
+        ftyp = _mp4_atom(b"ftyp", b"isom\x00\x00\x00\x00")
+        video_path.write_bytes(ftyp + moov + mdat)
+
+        _repair_sample_entry_for_target_codec(video_path, "hevc")
+
+        rewritten = video_path.read_bytes()
+        assert b"hvc1" in rewritten
+        assert b"avc1" not in rewritten
+        assert b"hvcC" in rewritten
+        assert b"avcC" not in rewritten
+        hvcc_offset = rewritten.find(b"hvcC")
+        hvcc_size = int.from_bytes(rewritten[hvcc_offset - 4 : hvcc_offset], "big")
+        assert hvcc_size > 16
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_repair_sample_entry_skips_non_hevc_targets_and_real_avcC() -> None:
+    root = _reset_test_dir()
+    try:
+        ftyp = _mp4_atom(b"ftyp", b"isom\x00\x00\x00\x00")
+        mdat = _mp4_atom(b"mdat", b"x" * 16)
+
+        empty_avcC = _mp4_atom(b"avcC", b"")
+        avc1_empty = _mp4_atom(b"avc1", b"\x00" * 78 + empty_avcC)
+        stsd_empty = _mp4_atom(b"stsd", b"\x00\x00\x00\x00" + (1).to_bytes(4, "big") + avc1_empty)
+        moov_empty = _mp4_atom(
+            b"moov",
+            _mp4_atom(b"trak", _mp4_atom(b"mdia", _mp4_atom(b"minf", _mp4_atom(b"stbl", stsd_empty)))),
+        )
+        wrong_target = root / "wrong_target.mp4"
+        original_wrong = ftyp + moov_empty + mdat
+        wrong_target.write_bytes(original_wrong)
+        _repair_sample_entry_for_target_codec(wrong_target, "av1")
+        assert wrong_target.read_bytes() == original_wrong
+
+        real_avcC = _mp4_atom(b"avcC", b"\x01" * 64)
+        avc1_real = _mp4_atom(b"avc1", b"\x00" * 78 + real_avcC)
+        stsd_real = _mp4_atom(b"stsd", b"\x00\x00\x00\x00" + (1).to_bytes(4, "big") + avc1_real)
+        moov_real = _mp4_atom(
+            b"moov",
+            _mp4_atom(b"trak", _mp4_atom(b"mdia", _mp4_atom(b"minf", _mp4_atom(b"stbl", stsd_real)))),
+        )
+        real_path = root / "real_avcc.mp4"
+        original_real = ftyp + moov_real + mdat
+        real_path.write_bytes(original_real)
+        _repair_sample_entry_for_target_codec(real_path, "hevc")
+        assert real_path.read_bytes() == original_real
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_extract_inline_hevc_param_sets_finds_vps_sps_pps_in_length_prefixed_mdat() -> None:
+    vps_nal = bytes([(32 << 1), 0x01]) + b"\xaa" * 6
+    sps_nal = bytes([(33 << 1), 0x01]) + b"\xbb" * 13
+    pps_nal = bytes([(34 << 1), 0x01]) + b"\xcc" * 4
+    body = b""
+    for nal in (vps_nal, sps_nal, pps_nal):
+        body += len(nal).to_bytes(4, "big") + nal
+    vps, sps, pps = _extract_inline_hevc_param_sets(body)
+    assert vps == vps_nal
+    assert sps == sps_nal
+    assert pps == pps_nal
+
+
+def test_build_hvcc_body_embeds_profile_tier_level_and_param_set_arrays() -> None:
+    sps = bytes([(33 << 1), 0x01]) + b"\x60" + b"\xaa" * 12 + b"\x00" * 4
+    vps = bytes([(32 << 1), 0x01]) + b"VPS"
+    pps = bytes([(34 << 1), 0x01]) + b"PPS"
+    body = _build_hvcc_body(vps, sps, pps)
+    assert body[0] == 1
+    assert body[1:13] == sps[3:15]
+    assert body[22] == 3
+    assert b"VPS" in body
+    assert b"PPS" in body
+
+
+def test_compressed_marker_renames_file_and_updates_media_item() -> None:
+    root = _reset_test_dir()
+    try:
+        video_path = root / "my video.mp4"
+        video_path.write_bytes(b"fake")
+        options = CompressionOptions()
+        owner = FakeCompressionOwner(options)
+        manager = CompressionManager(cast("Any", owner))
+
+        media_item = cast(
+            "MediaItem",
+            SimpleNamespace(
+                complete_file=video_path,
+                filename="my video.mp4",
+                download_filename="my video.mp4",
+                db_path="original/my video.mp4",
+                is_segment=False,
+                url="https://example.com/media",
+                filesize=4,
+            ),
+        )
+
+        new_path = asyncio.run(manager._apply_compressed_marker(media_item, video_path))
+
+        assert new_path.name == "[COMPRESSED] my video.mp4"
+        assert new_path.exists()
+        assert not video_path.exists()
+        assert media_item.complete_file == new_path
+        assert media_item.download_filename == new_path.name
+        assert media_item.filename == "my video.mp4"
+        assert media_item.db_path == "original/my video.mp4"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_compressed_marker_is_idempotent_when_prefix_already_present() -> None:
+    root = _reset_test_dir()
+    try:
+        already_marked = root / "[COMPRESSED] clip.mp4"
+        already_marked.write_bytes(b"data")
+        manager = CompressionManager(cast("Any", FakeCompressionOwner()))
+        media_item = cast(
+            "MediaItem",
+            SimpleNamespace(
+                complete_file=already_marked,
+                filename=already_marked.name,
+                download_filename=already_marked.name,
+                db_path="x",
+                is_segment=False,
+                url="https://example.com/media",
+                filesize=4,
+            ),
+        )
+
+        result_path = asyncio.run(manager._apply_compressed_marker(media_item, already_marked))
+        assert result_path == already_marked
+        assert already_marked.exists()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_compressed_marker_picks_counter_suffix_on_collision() -> None:
+    root = _reset_test_dir()
+    try:
+        source = root / "clip.mp4"
+        source.write_bytes(b"new")
+        collision = root / "[COMPRESSED] clip.mp4"
+        collision.write_bytes(b"old")
+        manager = CompressionManager(cast("Any", FakeCompressionOwner()))
+        media_item = cast(
+            "MediaItem",
+            SimpleNamespace(
+                complete_file=source,
+                filename=source.name,
+                download_filename=source.name,
+                db_path="x",
+                is_segment=False,
+                url="https://example.com/media",
+                filesize=3,
+            ),
+        )
+
+        new_path = asyncio.run(manager._apply_compressed_marker(media_item, source))
+        assert new_path.name == "[COMPRESSED] clip (1).mp4"
+        assert new_path.exists()
+        assert collision.exists()
+        assert not source.exists()
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
