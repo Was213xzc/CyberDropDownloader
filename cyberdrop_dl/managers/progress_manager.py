@@ -16,6 +16,7 @@ from rich.text import Text
 from yarl import URL
 
 from cyberdrop_dl import __version__
+from cyberdrop_dl.ui.progress.compression_progress import CompressionProgress
 from cyberdrop_dl.ui.progress.downloads_progress import DownloadsProgress
 from cyberdrop_dl.ui.progress.file_progress import FileProgress
 from cyberdrop_dl.ui.progress.hash_progress import HashProgress
@@ -54,6 +55,7 @@ class ProgressManager:
         self.scrape_stats_progress = ScrapeStatsProgress()
         self.hash_progress = HashProgress(manager)
         self.sort_progress = SortProgress(1, manager)
+        self.compression_progress = CompressionProgress(manager)
 
         self.compression_compressed_files = 0
         self.compression_skipped_files = 0
@@ -117,6 +119,7 @@ class ProgressManager:
         lower_layouts = (
             Layout(renderable=self.scraping_progress.get_renderable(), name="Scraping", ratio=20),
             Layout(renderable=self.file_progress.get_renderable(), name="Downloads", ratio=20),
+            Layout(renderable=self.compression_progress.get_renderable(), name="Compression", ratio=8),
             Layout(renderable=status_message_columns, name="status_message", ratio=2),
         )
 
@@ -203,6 +206,7 @@ class ProgressManager:
             self.compression_failed_files += 1
         else:
             self.compression_skipped_files += 1
+        self.compression_progress.add_result(status)
 
     def print_compression_stats(self) -> None:
         if not self.manager.config.compression_options.enabled:

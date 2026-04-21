@@ -9,14 +9,15 @@ import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Literal, cast
 
 from cyberdrop_dl.constants import FILE_FORMATS
 from cyberdrop_dl.utils.logger import log
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
-    from pathlib import Path
     from types import ModuleType
 
     from cyberdrop_dl.config.config_model import CompressionOptions
@@ -76,17 +77,33 @@ class CompressionManager:
         self._queue: asyncio.Queue[CompressionQueueItem | None] = asyncio.Queue()
         self._queue_tasks: list[asyncio.Task[None]] = []
         self._video_semaphores: defaultdict[int, asyncio.BoundedSemaphore] = defaultdict(self._make_video_semaphore)
+        self._pending_paths: set[str] = set()
+        self._pending_lock = asyncio.Lock()
+        self._resumed = False
 
     @property
     def options(self) -> CompressionOptions:
         return self.manager.config.compression_options
 
+    @property
+    def _pending_file(self) -> Path | None:
+        path_manager = getattr(self.manager, "path_manager", None)
+        candidate = getattr(path_manager, "compression_pending_file", None)
+        return candidate if isinstance(candidate, Path) else None
+
     def startup(self) -> None:
         self._queue_tasks = [task for task in self._queue_tasks if not task.done()]
         for worker_id in range(len(self._queue_tasks), self._queue_worker_count()):
+            new_worker_id = worker_id + 1
             self._queue_tasks.append(
-                asyncio.create_task(self._run_queue_worker(), name=f"cyberdrop-compression-worker-{worker_id + 1}")
+                asyncio.create_task(
+                    self._run_queue_worker(new_worker_id),
+                    name=f"cyberdrop-compression-worker-{new_worker_id}",
+                )
             )
+        if not self._resumed:
+            self._resumed = True
+            self._resume_pending_from_disk()
 
     async def close(self) -> None:
         await self.join()
@@ -116,6 +133,7 @@ class CompressionManager:
         completion_lock: asyncio.Lock | None = None,
     ) -> None:
         self.startup()
+        await self._track_pending(media_item.complete_file)
         await self._queue.put(
             CompressionQueueItem(
                 domain=domain,
@@ -128,22 +146,24 @@ class CompressionManager:
             )
         )
 
-    async def _run_queue_worker(self) -> None:
+    async def _run_queue_worker(self, worker_id: int) -> None:
         while True:
             item = await self._queue.get()
             try:
                 if item is None:
                     return
-                await self._process_queue_item(item)
+                await self._process_queue_item(item, worker_id)
             finally:
                 self._queue.task_done()
 
-    async def _process_queue_item(self, item: CompressionQueueItem) -> None:
+    async def _process_queue_item(self, item: CompressionQueueItem, worker_id: int) -> None:
+        source_path = Path(item.media_item.complete_file)
+        self._notify_current(worker_id, source_path)
         try:
             try:
                 await self.compress_media_item(item.media_item)
             except Exception as e:
-                log(f"Compression queue failed for {item.media_item.complete_file}: {e}", 40, exc_info=True)
+                log(f"Compression queue failed for {source_path}: {e}", 40, exc_info=True)
 
             try:
                 await item.process_completed(item.media_item, item.domain)
@@ -151,10 +171,126 @@ class CompressionManager:
                 if item.finalize_download is not None:
                     await item.finalize_download(item.media_item, downloaded=item.downloaded)
             except Exception as e:
-                log(f"Post-download completion failed for {item.media_item.complete_file}: {e}", 40, exc_info=True)
+                log(f"Post-download completion failed for {source_path}: {e}", 40, exc_info=True)
         finally:
+            self._notify_current(worker_id, None)
+            await self._untrack_pending(source_path)
             if item.completion_lock is not None and item.completion_lock.locked():
                 item.completion_lock.release()
+
+    async def _track_pending(self, path: Path) -> None:
+        key = self._pending_key(path)
+        async with self._pending_lock:
+            if key in self._pending_paths:
+                return
+            self._pending_paths.add(key)
+            await asyncio.to_thread(self._write_pending_file, sorted(self._pending_paths))
+        self._notify_pending_count()
+
+    async def _untrack_pending(self, path: Path) -> None:
+        key = self._pending_key(path)
+        async with self._pending_lock:
+            if key not in self._pending_paths:
+                return
+            self._pending_paths.discard(key)
+            await asyncio.to_thread(self._write_pending_file, sorted(self._pending_paths))
+        self._notify_pending_count()
+
+    @staticmethod
+    def _pending_key(path: Path) -> str:
+        return str(Path(path))
+
+    def _write_pending_file(self, entries: list[str]) -> None:
+        target = self._pending_file
+        if target is None:
+            return
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temp = target.with_suffix(target.suffix + ".tmp")
+            temp.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp.replace(target)
+        except OSError as e:
+            log(f"Unable to persist pending compression list: {e}", 30)
+
+    def _read_pending_file(self) -> list[str]:
+        target = self._pending_file
+        if target is None or not target.is_file():
+            return []
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            log(f"Unable to read pending compression list: {e}", 30)
+            return []
+        return [entry for entry in data if isinstance(entry, str)]
+
+    def _resume_pending_from_disk(self) -> None:
+        entries = self._read_pending_file()
+        resumable: list[str] = []
+        for entry in entries:
+            path = Path(entry)
+            if path.is_file():
+                resumable.append(self._pending_key(path))
+        if not resumable:
+            if entries:
+                self._write_pending_file([])
+            self._notify_pending_count()
+            return
+
+        self._pending_paths.update(resumable)
+        self._write_pending_file(sorted(self._pending_paths))
+        self._notify_pending_count()
+        log(f"Resuming {len(resumable)} pending compression(s) from previous session", 20)
+        try:
+            asyncio.get_running_loop().create_task(self._requeue_standalone_paths(resumable))
+        except RuntimeError:
+            return
+
+    async def _requeue_standalone_paths(self, paths: list[str]) -> None:
+        for entry in paths:
+            media_item = self._build_standalone_media_item(Path(entry))
+            await self._queue.put(
+                CompressionQueueItem(
+                    domain="",
+                    media_item=media_item,
+                    process_completed=_noop_process_completed,
+                    handle_completion=_noop_handle_completion,
+                )
+            )
+
+    def _build_standalone_media_item(self, path: Path) -> MediaItem:
+        from yarl import URL
+
+        absolute = path if path.is_absolute() else path.resolve()
+        stand_in = SimpleNamespace(
+            complete_file=path,
+            partial_file=path,
+            filename=path.name,
+            original_filename=path.name,
+            download_filename=path.name,
+            db_path="",
+            is_segment=False,
+            filesize=path.stat().st_size if path.is_file() else None,
+            url=URL(absolute.as_uri()),
+            ext=path.suffix,
+            hash=None,
+        )
+        return cast("MediaItem", stand_in)
+
+    def _notify_current(self, worker_id: int, path: Path | None) -> None:
+        progress = self._compression_progress()
+        if progress is None:
+            return
+        progress.set_current(worker_id, path)
+
+    def _notify_pending_count(self) -> None:
+        progress = self._compression_progress()
+        if progress is None:
+            return
+        progress.set_pending_count(len(self._pending_paths))
+
+    def _compression_progress(self):
+        progress_manager = getattr(self.manager, "progress_manager", None)
+        return getattr(progress_manager, "compression_progress", None)
 
     def _queue_worker_count(self) -> int:
         gpu_ids = self.options.gpu_ids or [0]
@@ -582,6 +718,14 @@ class CompressionManager:
                     candidates.append(candidate)
                     seen.add(candidate)
         return candidates
+
+
+async def _noop_process_completed(media_item: MediaItem, domain: str) -> None:
+    return None
+
+
+async def _noop_handle_completion(media_item: MediaItem, downloaded: bool = True) -> None:
+    return None
 
 
 def _format_pynv_exception(error: Exception, stage: str = "input") -> str:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -968,5 +969,191 @@ def test_download_lifecycle_enqueues_after_rename_and_duration_check() -> None:
             "add_duration",
             "enqueue",
         ]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+class FakeCompressionProgress:
+    def __init__(self) -> None:
+        self.pending_count = 0
+        self.current: dict[int, Path] = {}
+        self.results: list[str] = []
+
+    def set_pending_count(self, count: int) -> None:
+        self.pending_count = count
+
+    def set_current(self, worker_id: int, path: Path | None) -> None:
+        if path is None:
+            self.current.pop(worker_id, None)
+        else:
+            self.current[worker_id] = path
+
+    def add_result(self, status: str) -> None:
+        self.results.append(status)
+
+
+class FakePathManager:
+    def __init__(self, pending_file: Path) -> None:
+        self.compression_pending_file = pending_file
+
+
+def _owner_with_pending_file(pending_file: Path, options: CompressionOptions | None = None) -> FakeCompressionOwner:
+    owner = FakeCompressionOwner(options)
+    owner.path_manager = FakePathManager(pending_file)
+    owner.progress_manager.compression_progress = FakeCompressionProgress()
+    original_add = owner.progress_manager.add_compression_result
+
+    def add_compression_result(status: str, bytes_saved: int = 0) -> None:
+        original_add(status, bytes_saved)
+        owner.progress_manager.compression_progress.add_result(status)
+
+    owner.progress_manager.add_compression_result = add_compression_result
+    return owner
+
+
+def test_pending_compression_file_round_trip_and_pending_count() -> None:
+    root = _reset_test_dir()
+    try:
+        pending_file = root / "compression_pending.json"
+        owner = _owner_with_pending_file(pending_file)
+        compression_manager = CompressionManager(cast("Any", owner))
+
+        first = root / "video1.mp4"
+        second = root / "video2.mp4"
+
+        async def run() -> None:
+            await compression_manager._track_pending(first)
+            await compression_manager._track_pending(second)
+            await compression_manager._track_pending(first)
+
+        asyncio.run(run())
+
+        entries = compression_manager._read_pending_file()
+        assert sorted(entries) == sorted([str(first), str(second)])
+        assert owner.progress_manager.compression_progress.pending_count == 2
+        assert json.loads(pending_file.read_text(encoding="utf-8")) == entries
+
+        async def untrack() -> None:
+            await compression_manager._untrack_pending(first)
+
+        asyncio.run(untrack())
+
+        assert compression_manager._read_pending_file() == [str(second)]
+        assert owner.progress_manager.compression_progress.pending_count == 1
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_resume_skips_missing_files_and_requeues_existing_on_startup() -> None:
+    root = _reset_test_dir()
+    try:
+        pending_file = root / "compression_pending.json"
+        existing = root / "existing.mp4"
+        missing = root / "does_not_exist.mp4"
+        existing.write_bytes(b"data")
+        pending_file.write_text(
+            json.dumps([str(existing), str(missing)]),
+            encoding="utf-8",
+        )
+
+        owner = _owner_with_pending_file(pending_file, CompressionOptions(gpu_ids=[0], video_workers_per_gpu=1))
+        compression_manager = CompressionManager(cast("Any", owner))
+
+        processed: list[Path] = []
+
+        async def fake_compress(media_item: MediaItem) -> None:
+            processed.append(Path(media_item.complete_file))
+
+        compression_manager.compress_media_item = fake_compress
+
+        async def run() -> None:
+            compression_manager.startup()
+            for _ in range(20):
+                await asyncio.sleep(0)
+            await compression_manager.join()
+            await compression_manager.close()
+
+        asyncio.run(run())
+
+        assert processed == [existing]
+        assert compression_manager._read_pending_file() == []
+        assert owner.progress_manager.compression_progress.pending_count == 0
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_queue_worker_notifies_current_file_and_pending_count() -> None:
+    root = _reset_test_dir()
+    try:
+        pending_file = root / "compression_pending.json"
+        owner = _owner_with_pending_file(pending_file, CompressionOptions(gpu_ids=[0], video_workers_per_gpu=1))
+        compression_manager = CompressionManager(cast("Any", owner))
+
+        media_path = root / "media.jpg"
+        media_path.write_bytes(b"data")
+        progress = owner.progress_manager.compression_progress
+        snapshots: list[tuple[int, dict[int, Path]]] = []
+
+        async def fake_compress(media_item: MediaItem) -> None:
+            snapshots.append((progress.pending_count, dict(progress.current)))
+
+        async def noop_process(media_item: MediaItem, domain: str) -> None:
+            return None
+
+        async def noop_handle(media_item: MediaItem, downloaded: bool = True) -> None:
+            return None
+
+        compression_manager.compress_media_item = fake_compress
+
+        media_item = cast(
+            "MediaItem",
+            SimpleNamespace(
+                complete_file=media_path,
+                filename="media.jpg",
+                is_segment=False,
+            ),
+        )
+
+        async def run() -> None:
+            await compression_manager.enqueue_completed_download(
+                "example.com",
+                media_item,
+                noop_process,
+                noop_handle,
+            )
+            await compression_manager.join()
+            await compression_manager.close()
+
+        asyncio.run(run())
+
+        assert len(snapshots) == 1
+        pending_during, current_during = snapshots[0]
+        assert pending_during == 1
+        assert current_during == {1: media_path}
+        assert progress.pending_count == 0
+        assert progress.current == {}
+        assert compression_manager._read_pending_file() == []
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_resume_handles_empty_pending_file_without_errors() -> None:
+    root = _reset_test_dir()
+    try:
+        pending_file = root / "compression_pending.json"
+        pending_file.write_text("[]", encoding="utf-8")
+        owner = _owner_with_pending_file(pending_file)
+        compression_manager = CompressionManager(cast("Any", owner))
+
+        async def run() -> None:
+            compression_manager.startup()
+            for _ in range(5):
+                await asyncio.sleep(0)
+            await compression_manager.close()
+
+        asyncio.run(run())
+
+        assert compression_manager._read_pending_file() == []
+        assert owner.progress_manager.compression_progress.pending_count == 0
     finally:
         shutil.rmtree(root, ignore_errors=True)

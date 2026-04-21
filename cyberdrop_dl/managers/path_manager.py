@@ -43,6 +43,7 @@ class PathManager:
         self.scrape_error_urls_log: Path = field(init=False)
         self.skipped_duplicate_urls_log: Path = field(init=False)
         self.compression_report_log: Path = field(init=False)
+        self.compression_pending_file: Path = field(init=False)
         self.pages_folder: Path = field(init=False)
 
         self._logs_model_names = [
@@ -100,6 +101,7 @@ class PathManager:
         self.log_folder = replace(settings_data.logs.log_folder)
         self.input_file = replace(settings_data.files.input_file)
         self.history_db = self.cache_folder / "cyberdrop.db"
+        self.compression_pending_file = self.cache_folder / f"compression_pending_{current_config}.json"
         self.scan_folder = settings_data.sorting.scan_folder
         if self.scan_folder:
             self.scan_folder = replace(self.scan_folder)
