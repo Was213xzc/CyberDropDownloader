@@ -40,6 +40,7 @@ class DoodStreamCrawler(Crawler):
         "dood.yt",
         "do7go.com",
         "all3do.com",
+        "playmogo.com",
     )
     PRIMARY_URL: ClassVar[AbsoluteHttpURL] = PRIMARY_URL
     UPDATE_UNSUPPORTED: ClassVar[bool] = True
