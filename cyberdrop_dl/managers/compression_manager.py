@@ -79,6 +79,11 @@ class CompressionManager:
         self._video_semaphores: defaultdict[int, asyncio.BoundedSemaphore] = defaultdict(self._make_video_semaphore)
         self._pending_paths: set[str] = set()
         self._pending_lock = asyncio.Lock()
+        # queue.join() only covers items that have already been put on the queue.
+        # Track in-flight producers so shutdown also waits for late enqueues and resume requeues.
+        self._active_producers = 0
+        self._producers_idle = asyncio.Event()
+        self._producers_idle.set()
         self._resumed = False
 
     @property
@@ -119,7 +124,11 @@ class CompressionManager:
     async def join(self) -> None:
         if not self._queue_tasks:
             return
-        await self._queue.join()
+        while True:
+            await self._queue.join()
+            if self._active_producers == 0 and self._queue.empty():
+                return
+            await self._producers_idle.wait()
 
     async def enqueue_completed_download(
         self,
@@ -133,18 +142,22 @@ class CompressionManager:
         completion_lock: asyncio.Lock | None = None,
     ) -> None:
         self.startup()
-        await self._track_pending(media_item.complete_file)
-        await self._queue.put(
-            CompressionQueueItem(
-                domain=domain,
-                media_item=media_item,
-                process_completed=process_completed,
-                handle_completion=handle_completion,
-                downloaded=downloaded,
-                finalize_download=finalize_download,
-                completion_lock=completion_lock,
+        self._producer_started()
+        try:
+            await self._track_pending(media_item.complete_file)
+            await self._queue.put(
+                CompressionQueueItem(
+                    domain=domain,
+                    media_item=media_item,
+                    process_completed=process_completed,
+                    handle_completion=handle_completion,
+                    downloaded=downloaded,
+                    finalize_download=finalize_download,
+                    completion_lock=completion_lock,
+                )
             )
-        )
+        finally:
+            self._producer_finished()
 
     async def _run_queue_worker(self, worker_id: int) -> None:
         while True:
@@ -240,10 +253,18 @@ class CompressionManager:
         self._write_pending_file(sorted(self._pending_paths))
         self._notify_pending_count()
         log(f"Resuming {len(resumable)} pending compression(s) from previous session", 20)
+        self._producer_started()
         try:
-            asyncio.get_running_loop().create_task(self._requeue_standalone_paths(resumable))
+            asyncio.get_running_loop().create_task(self._run_requeue_standalone_paths(resumable))
         except RuntimeError:
+            self._producer_finished()
             return
+
+    async def _run_requeue_standalone_paths(self, paths: list[str]) -> None:
+        try:
+            await self._requeue_standalone_paths(paths)
+        finally:
+            self._producer_finished()
 
     async def _requeue_standalone_paths(self, paths: list[str]) -> None:
         for entry in paths:
@@ -291,6 +312,15 @@ class CompressionManager:
     def _compression_progress(self):
         progress_manager = getattr(self.manager, "progress_manager", None)
         return getattr(progress_manager, "compression_progress", None)
+
+    def _producer_started(self) -> None:
+        self._active_producers += 1
+        self._producers_idle.clear()
+
+    def _producer_finished(self) -> None:
+        self._active_producers = max(0, self._active_producers - 1)
+        if self._active_producers == 0:
+            self._producers_idle.set()
 
     def _queue_worker_count(self) -> int:
         gpu_ids = self.options.gpu_ids or [0]

@@ -1068,8 +1068,6 @@ def test_resume_skips_missing_files_and_requeues_existing_on_startup() -> None:
 
         async def run() -> None:
             compression_manager.startup()
-            for _ in range(20):
-                await asyncio.sleep(0)
             await compression_manager.join()
             await compression_manager.close()
 
@@ -1078,6 +1076,50 @@ def test_resume_skips_missing_files_and_requeues_existing_on_startup() -> None:
         assert processed == [existing]
         assert compression_manager._read_pending_file() == []
         assert owner.progress_manager.compression_progress.pending_count == 0
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_join_waits_for_startup_requeue_before_returning() -> None:
+    root = _reset_test_dir()
+    try:
+        pending_file = root / "compression_pending.json"
+        existing = root / "existing.mp4"
+        existing.write_bytes(b"data")
+        pending_file.write_text(json.dumps([str(existing)]), encoding="utf-8")
+
+        owner = _owner_with_pending_file(pending_file, CompressionOptions(gpu_ids=[0], video_workers_per_gpu=1))
+        compression_manager = CompressionManager(cast("Any", owner))
+        processed: list[Path] = []
+        requeue_started = asyncio.Event()
+        release_requeue = asyncio.Event()
+        original_requeue = compression_manager._requeue_standalone_paths
+
+        async def delayed_requeue(paths: list[str]) -> None:
+            requeue_started.set()
+            await release_requeue.wait()
+            await original_requeue(paths)
+
+        async def fake_compress(media_item: MediaItem) -> None:
+            processed.append(Path(media_item.complete_file))
+
+        compression_manager._requeue_standalone_paths = delayed_requeue
+        compression_manager.compress_media_item = fake_compress
+
+        async def run() -> None:
+            compression_manager.startup()
+            join_task = asyncio.create_task(compression_manager.join())
+            await asyncio.wait_for(requeue_started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            assert not join_task.done()
+            release_requeue.set()
+            await asyncio.wait_for(join_task, timeout=1)
+            await compression_manager.close()
+
+        asyncio.run(run())
+
+        assert processed == [existing]
+        assert compression_manager._read_pending_file() == []
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -1132,6 +1174,70 @@ def test_queue_worker_notifies_current_file_and_pending_count() -> None:
         assert current_during == {1: media_path}
         assert progress.pending_count == 0
         assert progress.current == {}
+        assert compression_manager._read_pending_file() == []
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_join_waits_for_in_flight_enqueue_before_returning() -> None:
+    root = _reset_test_dir()
+    try:
+        pending_file = root / "compression_pending.json"
+        owner = _owner_with_pending_file(pending_file, CompressionOptions(gpu_ids=[0], video_workers_per_gpu=1))
+        compression_manager = CompressionManager(cast("Any", owner))
+        media_path = root / "media.mp4"
+        media_path.write_bytes(b"data")
+        enqueue_started = asyncio.Event()
+        release_enqueue = asyncio.Event()
+        original_track_pending = compression_manager._track_pending
+        processed: list[Path] = []
+
+        async def delayed_track_pending(path: Path) -> None:
+            enqueue_started.set()
+            await release_enqueue.wait()
+            await original_track_pending(path)
+
+        async def fake_compress(media_item: MediaItem) -> None:
+            processed.append(Path(media_item.complete_file))
+
+        async def noop_process(media_item: MediaItem, domain: str) -> None:
+            return None
+
+        async def noop_handle(media_item: MediaItem, downloaded: bool = True) -> None:
+            return None
+
+        compression_manager._track_pending = delayed_track_pending
+        compression_manager.compress_media_item = fake_compress
+        media_item = cast(
+            "MediaItem",
+            SimpleNamespace(
+                complete_file=media_path,
+                filename="media.mp4",
+                is_segment=False,
+            ),
+        )
+
+        async def run() -> None:
+            enqueue_task = asyncio.create_task(
+                compression_manager.enqueue_completed_download(
+                    "example.com",
+                    media_item,
+                    noop_process,
+                    noop_handle,
+                )
+            )
+            await asyncio.wait_for(enqueue_started.wait(), timeout=1)
+            join_task = asyncio.create_task(compression_manager.join())
+            await asyncio.sleep(0)
+            assert not join_task.done()
+            release_enqueue.set()
+            await asyncio.wait_for(enqueue_task, timeout=1)
+            await asyncio.wait_for(join_task, timeout=1)
+            await compression_manager.close()
+
+        asyncio.run(run())
+
+        assert processed == [media_path]
         assert compression_manager._read_pending_file() == []
     finally:
         shutil.rmtree(root, ignore_errors=True)
