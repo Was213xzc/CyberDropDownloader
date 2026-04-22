@@ -209,7 +209,9 @@ class RecoveryCrawler(Crawler):
 def test_completed_video_is_requeued_for_compression_recovery() -> None:
     root = _reset_test_dir()
     try:
-        (root / "video.mp4").write_bytes(b"data")
+        stored_root = root / "stored"
+        stored_root.mkdir()
+        (stored_root / "video.mp4").write_bytes(b"data")
         calls: list[str] = []
 
         class FakeDatabase:
@@ -220,7 +222,7 @@ def test_completed_video_is_requeued_for_compression_recovery() -> None:
                     db_path="/video",
                     referer="https://example.com/post",
                     album_id=None,
-                    download_path=str(root),
+                    download_path=str(stored_root),
                     download_filename="video.mp4",
                     original_filename="video.mp4",
                     file_size=4,
@@ -244,7 +246,9 @@ def test_completed_video_is_requeued_for_compression_recovery() -> None:
                 downloaded: bool = False,
                 allow_images: bool = True,
             ) -> bool:
-                calls.append(f"enqueue:{domain}:{downloaded}:{allow_images}:{media_item.filename}")
+                calls.append(
+                    f"enqueue:{domain}:{downloaded}:{allow_images}:{media_item.filename}:{media_item.download_folder == stored_root}"
+                )
                 return True
 
         class FakeDownloadProgress:
@@ -264,7 +268,7 @@ def test_completed_video_is_requeued_for_compression_recovery() -> None:
                 url=AbsoluteHttpURL("https://example.com/video.mp4"),
                 referer=AbsoluteHttpURL("https://example.com/post"),
                 domain="example.com",
-                download_folder=root,
+                download_folder=root / "new-run-folder",
                 filename="video.mp4",
                 original_filename="video.mp4",
                 download_filename=None,
@@ -284,9 +288,12 @@ def test_completed_video_is_requeued_for_compression_recovery() -> None:
         assert calls == [
             "update:video.mp4",
             "previous:True",
-            "enqueue:example.com:False:False:video.mp4",
+            "enqueue:example.com:False:False:video.mp4:True",
         ]
     finally:
-        for path in root.glob("*"):
-            path.unlink(missing_ok=True)
+        for path in root.rglob("*"):
+            if path.is_file():
+                path.unlink(missing_ok=True)
+        for path in sorted((p for p in root.rglob("*") if p.is_dir()), reverse=True):
+            path.rmdir()
         root.rmdir()

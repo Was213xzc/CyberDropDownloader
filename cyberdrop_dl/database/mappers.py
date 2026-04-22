@@ -30,9 +30,11 @@ def media_defaults_from_media_item(media_item: MediaItem) -> MediaDefaults:
 
 
 def apply_media_row(media_item: MediaItem, row: MediaItemRow) -> None:
+    media_item.download_folder = Path(row.download_path)
     if row.download_filename:
         media_item.download_filename = row.download_filename
         media_item.filename = row.download_filename
+        media_item.complete_file = media_item.download_folder / row.download_filename
     if row.file_size is not None:
         media_item.filesize = row.file_size
     if row.duration is not None:

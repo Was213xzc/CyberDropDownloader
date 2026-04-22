@@ -117,3 +117,25 @@ async def test_update_media_item_persists_media_files_and_hashes(tmp_path: Path)
         assert ("xxh128", "abc123") in {(hash_row.hash_type, hash_row.hash) for hash_row in files[0].hashes}
     finally:
         await database.close()
+
+
+async def test_apply_media_row_restores_saved_download_folder(tmp_path: Path) -> None:
+    database, _ = await _create_database(tmp_path)
+    media_item = _build_media_item(tmp_path)
+
+    row = await database.get_media_item(
+        media_lookup_from_media_item(media_item),
+        media_defaults_from_media_item(media_item),
+    )
+    moved_folder = tmp_path / "moved-downloads"
+    moved_folder.mkdir(parents=True, exist_ok=True)
+    media_item.download_folder = moved_folder
+    media_item.complete_file = None
+
+    try:
+        apply_media_row(media_item, row)
+
+        assert media_item.download_folder == Path(row.download_path)
+        assert media_item.complete_file is None
+    finally:
+        await database.close()
