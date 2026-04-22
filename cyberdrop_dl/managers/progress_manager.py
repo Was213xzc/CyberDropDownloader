@@ -119,7 +119,7 @@ class ProgressManager:
         lower_layouts = (
             Layout(renderable=self.scraping_progress.get_renderable(), name="Scraping", ratio=20),
             Layout(renderable=self.file_progress.get_renderable(), name="Downloads", ratio=20),
-            Layout(renderable=self.compression_progress.get_renderable(), name="Compression", ratio=8),
+            Layout(renderable=self.compression_progress.get_renderable(), name="Compression", ratio=8, minimum_size=5),
             Layout(renderable=status_message_columns, name="status_message", ratio=2),
         )
 
