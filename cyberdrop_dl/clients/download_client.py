@@ -100,7 +100,7 @@ class DownloadClient:
     async def _download(self, domain: str, media_item: MediaItem) -> bool:
         """Downloads a file."""
         download_headers = self._get_download_headers(domain, media_item.referer)
-        downloaded_filename = await self.manager.db_manager.history_table.get_downloaded_filename(domain, media_item)
+        downloaded_filename = media_item.download_filename or media_item.filename
         download_dir = self.get_download_dir(media_item)
         if media_item.is_segment:
             media_item.partial_file = media_item.complete_file = download_dir / media_item.filename
@@ -150,20 +150,36 @@ class DownloadClient:
                     return True
                 log(f"Skipping {media_item.url} as it has already been downloaded", 10)
                 self.manager.progress_manager.download_progress.add_previously_completed(False)
-                await self.process_completed(media_item, domain)
-                await self.handle_media_item_completion(media_item, downloaded=False)
+                queued = await self.manager.compression_manager.enqueue_existing_file_if_needed(
+                    domain,
+                    media_item,
+                    self.process_completed,
+                    self.handle_media_item_completion,
+                    downloaded=False,
+                )
+                if not queued:
+                    await self.process_completed(media_item, domain)
+                    await self.handle_media_item_completion(media_item, downloaded=False)
 
                 return False
             if await self.check_duplicate_filename_size(domain, media_item):
                 log(
                     f"Skipping {media_item.url} because {media_item.download_filename} "
                     "with the same file size has already been downloaded",
-                    10,
+                10,
                 )
                 self.manager.progress_manager.download_progress.add_previously_completed(False)
                 self.manager.log_manager.write_skipped_duplicate_url_log(media_item)
-                await self.process_completed(media_item, domain)
-                await self.handle_media_item_completion(media_item, downloaded=False)
+                queued = await self.manager.compression_manager.enqueue_existing_file_if_needed(
+                    domain,
+                    media_item,
+                    self.process_completed,
+                    self.handle_media_item_completion,
+                    downloaded=False,
+                )
+                if not queued:
+                    await self.process_completed(media_item, domain)
+                    await self.handle_media_item_completion(media_item, downloaded=False)
                 return False
 
         if resp.status != HTTPStatus.PARTIAL_CONTENT:
@@ -349,7 +365,6 @@ class DownloadClient:
             await asyncio.to_thread(media_item.partial_file.rename, media_item.complete_file)
             if not media_item.is_segment:
                 proceed = await self.client_manager.check_file_duration(media_item)
-                await self.manager.db_manager.history_table.add_duration(domain, media_item)
                 if not proceed:
                     log(f"Download Skip {media_item.url} due to runtime restrictions", 10)
                     await asyncio.to_thread(media_item.complete_file.unlink)
@@ -372,15 +387,18 @@ class DownloadClient:
         """Marks the media item as incomplete in the database."""
         if media_item.is_segment:
             return
-        await self.manager.db_manager.history_table.insert_incompleted(domain, media_item)
+        media_item.db_completed = False
+        await self.manager.database.update_media_item(media_item)
 
     async def process_completed(self, media_item: MediaItem, domain: str) -> None:
         """Marks the media item as completed in the database and adds to the completed list."""
-        await self.mark_completed(domain, media_item)
+        media_item.db_completed = True
         await self.add_file_size(domain, media_item)
+        await self.manager.database.update_media_item(media_item)
 
     async def mark_completed(self, domain: str, media_item: MediaItem) -> None:
-        await self.manager.db_manager.history_table.mark_complete(domain, media_item)
+        media_item.db_completed = True
+        await self.manager.database.update_media_item(media_item)
 
     async def add_file_size(self, domain: str, media_item: MediaItem) -> None:
         if not media_item.complete_file:
@@ -389,7 +407,7 @@ class DownloadClient:
         if file_size is None:
             file_size = media_item.filesize
         if file_size is not None:
-            await self.manager.db_manager.history_table.add_filesize(domain, media_item, file_size)
+            media_item.filesize = file_size
 
     def _get_completed_file_size(self, media_item: MediaItem) -> int | None:
         if media_item.complete_file.is_file():
@@ -398,7 +416,7 @@ class DownloadClient:
 
     async def check_duplicate_filename_size(self, domain: str, media_item: MediaItem) -> bool:
         """Checks history for a completed same-domain file with this final name and size."""
-        return await self.manager.db_manager.history_table.check_complete_by_filename_size(
+        return await self.manager.database.check_complete_by_filename_size(
             domain,
             media_item.download_filename,
             media_item.filesize,
@@ -461,10 +479,7 @@ class DownloadClient:
                 proceed = False
                 break
 
-            downloaded_filename = await self.manager.db_manager.history_table.get_downloaded_filename(
-                domain,
-                media_item,
-            )
+            downloaded_filename = media_item.download_filename
             if not downloaded_filename:
                 media_item.complete_file, media_item.partial_file = await self.iterate_filename(
                     media_item.complete_file,
@@ -519,7 +534,7 @@ class DownloadClient:
 
             media_item.filename = downloaded_filename
         media_item.download_filename = media_item.complete_file.name
-        await self.manager.db_manager.history_table.add_download_filename(domain, media_item)
+        await self.manager.database.update_media_item(media_item)
         return proceed, skip
 
     async def iterate_filename(self, complete_file: Path, media_item: MediaItem) -> tuple[Path, Path]:
@@ -531,7 +546,7 @@ class DownloadClient:
             temp_complete_file = media_item.download_folder / filename
             if (
                 not temp_complete_file.exists()
-                and not await self.manager.db_manager.history_table.check_filename_exists(filename)
+                and not await self.manager.database.check_download_filename_exists(filename)
             ):
                 media_item.filename = filename
                 complete_file = media_item.download_folder / media_item.filename

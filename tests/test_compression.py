@@ -887,10 +887,6 @@ def test_download_lifecycle_enqueues_after_rename_and_duration_check() -> None:
         partial_file.write_text("downloaded", encoding="utf8")
         order: list[str] = []
 
-        class FakeHistoryTable:
-            async def add_duration(self, domain: str, media_item: MediaItem) -> None:
-                order.append("add_duration")
-
         class FakeClientManager:
             def __init__(self, manager: Any) -> None:
                 self.manager = manager
@@ -932,7 +928,7 @@ def test_download_lifecycle_enqueues_after_rename_and_duration_check() -> None:
             config=ConfigSettings(),
             config_manager=SimpleNamespace(settings_data=ConfigSettings()),
             states=SimpleNamespace(RUNNING=running),
-            db_manager=SimpleNamespace(history_table=FakeHistoryTable()),
+            database=SimpleNamespace(),
             compression_manager=FakeCompressionManager(),
         )
         client_manager = FakeClientManager(manager)
@@ -966,7 +962,6 @@ def test_download_lifecycle_enqueues_after_rename_and_duration_check() -> None:
         assert order == [
             "download",
             "duration",
-            "add_duration",
             "enqueue",
         ]
     finally:

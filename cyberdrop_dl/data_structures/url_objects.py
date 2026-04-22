@@ -171,6 +171,7 @@ class MediaItem:
     complete_file: Path = None  # type: ignore
     hash: str | None = field(default=None, compare=False)
     downloaded: bool = field(default=False, compare=False)
+    db_completed: bool | None = field(default=None, compare=False)
 
     parent_media_item: MediaItem | None = field(default=None, compare=False)
     _task_id: TaskID | None = field(default=None, compare=False)
@@ -241,7 +242,7 @@ class MediaItem:
         item["attempts"] = item.pop("current_attempt")
         if self.hash:
             item["hash"] = f"xxh128:{self.hash}"
-        for name in ("fallbacks", "_task_id", "is_segment", "parent_media_item"):
+        for name in ("fallbacks", "_task_id", "db_completed", "is_segment", "parent_media_item"):
             _ = item.pop(name)
         return item
 

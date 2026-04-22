@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 
 def get_hashes(path: Path) -> set[tuple[str, str]]:
-    query = "SELECT hash_type, hash FROM hash "
+    query = "SELECT hash_type, hash FROM media_hashes "
     conn = sqlite3.connect(path)
     try:
         cursor = conn.execute(query)

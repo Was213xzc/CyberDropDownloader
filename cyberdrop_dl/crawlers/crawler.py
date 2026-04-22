@@ -18,6 +18,8 @@ from yarl import URL
 
 from cyberdrop_dl import constants
 from cyberdrop_dl.clients.scraper_client import ScraperClient
+from cyberdrop_dl.database import FileQuery
+from cyberdrop_dl.database.mappers import apply_media_row, media_defaults_from_media_item, media_lookup_from_media_item
 from cyberdrop_dl.data_structures.mediaprops import ISO639Subtitle, Resolution
 from cyberdrop_dl.data_structures.url_objects import AbsoluteHttpURL, MediaItem, ScrapeItem, copy_signature
 from cyberdrop_dl.downloader.downloader import Downloader
@@ -473,7 +475,7 @@ class Crawler(ABC):
         This method is called automatically on a created media item,
         but Crawler code can use it to skip unnecessary requests"""
         db_path = self.create_db_path(url)
-        check_complete = await self.manager.db_manager.history_table.check_complete(self.DOMAIN, url, referer, db_path)
+        check_complete = await self.manager.database.check_complete(self.DOMAIN, url, referer, db_path)
         if check_complete:
             log(f"Skipping {url} as it has already been downloaded", 10)
             self.manager.progress_manager.download_progress.add_previously_completed()
@@ -485,16 +487,33 @@ class Crawler(ABC):
             msg = f"Invalid datetime from '{self.FOLDER_DOMAIN}' crawler . Got {media_item.datetime!r}, expected int."
             log(msg, bug=True)
 
-        check_complete = await self.check_complete(media_item.url, media_item.referer)
-        if check_complete:
-            if media_item.album_id:
-                await self.manager.db_manager.history_table.set_album_id(self.DOMAIN, media_item)
+        row = await self.manager.database.get_media_item(
+            media_lookup_from_media_item(media_item),
+            media_defaults_from_media_item(media_item),
+        )
+        apply_media_row(media_item, row)
+
+        if row.completed:
+            await self.manager.database.update_media_item(media_item)
+            self.manager.progress_manager.download_progress.add_previously_completed()
+            queued = await self.manager.compression_manager.enqueue_existing_file_if_needed(
+                self.DOMAIN,
+                media_item,
+                self.downloader.client.process_completed,
+                self.downloader.client.handle_media_item_completion,
+                downloaded=False,
+                allow_images=False,
+            )
+            if queued:
+                return
+            log(f"Skipping {media_item.url} as it has already been downloaded", 10)
             return
 
         if await self.check_skip_by_config(media_item):
             self.manager.progress_manager.download_progress.add_skipped()
             return
 
+        await self.manager.database.update_media_item(media_item)
         self.create_task(self._download(media_item, m3u8))
 
     @final
@@ -527,7 +546,7 @@ class Crawler(ABC):
         """
         url = scrape_item if isinstance(scrape_item, URL) else scrape_item.url
         domain = None if any_crawler else self.DOMAIN
-        downloaded = await self.manager.db_manager.history_table.check_complete_by_referer(domain, url)
+        downloaded = await self.manager.database.check_complete_by_referer(domain, url)
         if downloaded:
             log(f"Skipping {url} as it has already been downloaded", 10)
             self.manager.progress_manager.download_progress.add_previously_completed()
@@ -539,7 +558,7 @@ class Crawler(ABC):
         self: Crawler, scrape_item: ScrapeItem | URL, hash_type: Literal["md5", "sha256"], hash_value: str
     ) -> bool:
         """Returns `True` if at least 1 file with this hash is recorded on the database"""
-        downloaded = await self.manager.db_manager.hash_table.check_hash_exists(hash_type, hash_value)
+        downloaded = bool(await self.manager.database.get_files(FileQuery(hash_type=hash_type, hash_value=hash_value)))
         if downloaded:
             url = scrape_item if isinstance(scrape_item, URL) else scrape_item.url
             log(f"Skipping {url} as its hash ({hash_type}:{hash_value}) has already been downloaded", 10)
@@ -548,7 +567,7 @@ class Crawler(ABC):
 
     async def get_album_results(self, album_id: str) -> dict[str, int]:
         """Checks whether an album has completed given its domain and album id."""
-        return await self.manager.db_manager.history_table.check_album(self.DOMAIN, album_id)
+        return await self.manager.database.check_album(self.DOMAIN, album_id)
 
     def handle_external_links(self, scrape_item: ScrapeItem, reset: bool = True) -> None:
         """Maps external links to the scraper class."""

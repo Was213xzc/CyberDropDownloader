@@ -10,7 +10,6 @@ from pydantic import BaseModel
 
 from cyberdrop_dl import __version__, constants
 from cyberdrop_dl.database import Database
-from cyberdrop_dl.database.transfer import transfer_v5_db_to_v6
 from cyberdrop_dl.managers.cache_manager import CacheManager
 from cyberdrop_dl.managers.client_manager import ClientManager
 from cyberdrop_dl.managers.compression_manager import CompressionManager
@@ -50,7 +49,7 @@ class Manager:
         self.hash_manager: HashManager = field(init=False)
 
         self.log_manager: LogManager = field(init=False)
-        self.db_manager: Database = field(init=False)
+        self.database: Database = field(init=False)
         self.client_manager: ClientManager = field(init=False)
         self.storage_manager: StorageManager = field(init=False)
         self.compression_manager: CompressionManager = field(init=False)
@@ -76,6 +75,14 @@ class Manager:
     @property
     def config(self):
         return self.config_manager.settings_data
+
+    @property
+    def db_manager(self) -> Database:
+        return self.database
+
+    @db_manager.setter
+    def db_manager(self, value: Database) -> None:
+        self.database = value
 
     @property
     def auth_config(self):
@@ -146,13 +153,12 @@ class Manager:
         constants.MAX_NAME_LENGTHS["FOLDER"] = self.config_manager.global_settings_data.general.max_folder_name_length
 
     async def async_db_hash_startup(self) -> None:
-        if not isinstance(self.db_manager, Database):
-            self.db_manager = Database(
+        if not isinstance(self.database, Database):
+            self.database = Database(
                 self.path_manager.history_db,
                 self.config.runtime_options.ignore_history,
             )
-            await self.db_manager.startup()
-        transfer_v5_db_to_v6(self.path_manager.history_db)
+            await self.database.startup()
         if not isinstance(self.hash_manager, HashManager):
             self.hash_manager = HashManager(self)
         if not isinstance(self.live_manager, LiveManager):
@@ -222,7 +228,7 @@ class Manager:
     async def async_db_close(self) -> None:
         "Partial shutdown for managers used for hash directory scanner"
         self.compression_manager = await close_if_defined(self.compression_manager)
-        self.db_manager = await close_if_defined(self.db_manager)
+        self.database = await close_if_defined(self.database)
         self.hash_manager = constants.NOT_DEFINED
         self.progress_manager.hash_progress.reset()
 

@@ -438,7 +438,7 @@ class ClientManager:
         if duration is None:
             return True
 
-        await self.manager.db_manager.history_table.add_duration(media_item.domain, media_item)
+        await self.manager.database.update_media_item(media_item)
 
         if is_video:
             max_video_duration = max_video_duration or float("inf")

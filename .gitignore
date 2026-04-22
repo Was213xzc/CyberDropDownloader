@@ -17,6 +17,7 @@ __pycache__
 /.pytest_tmp/
 /.ruff_cache/
 /pytest-cache-files-*/
+/.tmp_pytest*/
 
 # Local crawler debug/temp artifacts
 /bunkrr_*.txt
@@ -25,6 +26,7 @@ __pycache__
 /tmp_*/
 /tmp_*.html
 /tmp_*.js
+/.codex_*/
 
 # venv
 .venv

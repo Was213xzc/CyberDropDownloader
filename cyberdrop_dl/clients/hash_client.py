@@ -9,6 +9,8 @@ from send2trash import send2trash
 
 from cyberdrop_dl import constants
 from cyberdrop_dl.constants import Hashing
+from cyberdrop_dl.database import FileQuery, HashRow
+from cyberdrop_dl.database.mappers import file_row_from_path
 from cyberdrop_dl.ui.prompts.basic_prompts import enter_to_continue
 from cyberdrop_dl.utils.logger import log
 from cyberdrop_dl.utils.utilities import get_size_or_none
@@ -118,27 +120,32 @@ class HashClient:
     ) -> str | None:
         """Generates hash of a file."""
         self.manager.progress_manager.hash_progress.update_currently_hashing(file)
-        hash = await self.manager.db_manager.hash_table.get_file_hash_exists(file, hash_type)
+        file_row = await asyncio.to_thread(
+            file_row_from_path,
+            file,
+            original_filename=original_filename,
+            referer=str(referer) if referer else None,
+        )
+        existing_files = await self.manager.database.get_files(
+            FileQuery(folder=file_row.folder, download_filename=file_row.download_filename)
+        )
+        hash = next(
+            (
+                hash_row.hash
+                for existing_file in existing_files
+                for hash_row in existing_file.hashes
+                if hash_row.hash_type == hash_type
+            ),
+            None,
+        )
         try:
             if not hash:
                 hash = await self.manager.hash_manager.hash_file(file, hash_type)
-                await self.manager.db_manager.hash_table.insert_or_update_hash_db(
-                    hash,
-                    hash_type,
-                    file,
-                    original_filename,
-                    referer,
-                )
+                await self.manager.database.update_files(file_row, [HashRow(hash_type=hash_type, hash=hash)])
                 self.manager.progress_manager.hash_progress.add_new_completed_hash(hash_type)
             else:
                 self.manager.progress_manager.hash_progress.add_prev_hash()
-                await self.manager.db_manager.hash_table.insert_or_update_hash_db(
-                    hash,
-                    hash_type,
-                    file,
-                    original_filename,
-                    referer,
-                )
+                await self.manager.database.update_files(file_row, [HashRow(hash_type=hash_type, hash=hash)])
         except Exception as e:
             log(f"Error hashing '{file}' : {e}", 40, exc_info=True)
         else:
@@ -170,13 +177,14 @@ class HashClient:
     async def final_dupe_cleanup(self, final_dict: dict[str, dict]) -> None:
         """cleanup files based on dedupe setting"""
 
-        get_matches = self.manager.db_manager.hash_table.get_files_with_hash_matches
         async with asyncio.TaskGroup() as tg:
 
             async def delete_dupes(hash_value: str, size: int) -> None:
-                db_matches = await get_matches(hash_value, size, "xxh128")
+                db_matches = await self.manager.database.get_files(
+                    FileQuery(hash_type="xxh128", hash_value=hash_value, file_size=size)
+                )
                 for row in db_matches[1:]:
-                    file = Path(row["folder"], row["download_filename"])
+                    file = Path(row.folder, row.download_filename)
                     await self._sem.acquire()
                     tg.create_task(self._delete_and_log(file, hash_value))
 

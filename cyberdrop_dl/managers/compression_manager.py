@@ -159,6 +159,28 @@ class CompressionManager:
         finally:
             self._producer_finished()
 
+    async def enqueue_existing_file_if_needed(
+        self,
+        domain: str,
+        media_item: MediaItem,
+        process_completed: Callable[[MediaItem, str], Awaitable[None]],
+        handle_completion: Callable[[MediaItem, bool], Awaitable[None]],
+        *,
+        downloaded: bool = False,
+        allow_images: bool = True,
+    ) -> bool:
+        if not await self._should_enqueue_existing_file(media_item, allow_images=allow_images):
+            return False
+
+        await self.enqueue_completed_download(
+            domain,
+            media_item,
+            process_completed,
+            handle_completion,
+            downloaded=downloaded,
+        )
+        return True
+
     async def _run_queue_worker(self, worker_id: int) -> None:
         while True:
             item = await self._queue.get()
@@ -312,6 +334,27 @@ class CompressionManager:
     def _compression_progress(self):
         progress_manager = getattr(self.manager, "progress_manager", None)
         return getattr(progress_manager, "compression_progress", None)
+
+    async def _should_enqueue_existing_file(self, media_item: MediaItem, *, allow_images: bool) -> bool:
+        options = self.options
+        if not options.enabled or media_item.is_segment:
+            return False
+
+        source = getattr(media_item, "complete_file", None)
+        if source is None:
+            filename = media_item.download_filename or media_item.filename
+            source = media_item.download_folder / filename
+            media_item.complete_file = source
+        source = Path(source)
+        if not await asyncio.to_thread(source.is_file):
+            return False
+
+        ext = source.suffix.lower()
+        if options.compress_videos and ext in FILE_FORMATS["Videos"]:
+            return not source.name.startswith(_COMPRESSED_MARKER)
+        if allow_images and options.compress_images and ext in FILE_FORMATS["Images"]:
+            return True
+        return False
 
     def _producer_started(self) -> None:
         self._active_producers += 1

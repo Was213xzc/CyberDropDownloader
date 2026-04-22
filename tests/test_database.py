@@ -2,25 +2,22 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import pytest
 
+from cyberdrop_dl.database import RetryMediaRow
 from cyberdrop_dl.data_structures.url_objects import AbsoluteHttpURL, ScrapeItem
 from cyberdrop_dl.scraper import scrape_mapper
 from cyberdrop_dl.scraper.scrape_mapper import _create_item_from_row
 from cyberdrop_dl.utils.utilities import parse_url
 
-if TYPE_CHECKING:
-    import aiosqlite
-
-
-_MOCK_ROW = {
-    "referer": "https://drive.google.com/file/d/1F0YBsnQRvrMbK0p9UlnyLu88kqQ0j_F6/edit",
-    "download_path": "/cdl/downloads",
-    "completed_at": None,
-    "created_at": None,
-}
+_MOCK_ROW = RetryMediaRow(
+    referer="https://drive.google.com/file/d/1F0YBsnQRvrMbK0p9UlnyLu88kqQ0j_F6/edit",
+    download_path="/cdl/downloads",
+    completed_at=None,
+    created_at=None,
+)
 
 
 @pytest.fixture
@@ -29,18 +26,26 @@ def item() -> ScrapeItem:
 
 
 @pytest.fixture
-def row() -> aiosqlite.Row:
-    return cast("aiosqlite.Row", _MOCK_ROW.copy())  # pyright: ignore[reportInvalidCast]
+def row() -> RetryMediaRow:
+    return RetryMediaRow(
+        referer=_MOCK_ROW.referer,
+        download_path=_MOCK_ROW.download_path,
+        completed_at=_MOCK_ROW.completed_at,
+        created_at=_MOCK_ROW.created_at,
+    )
 
 
 @pytest.fixture
-def row_with_dates(row) -> aiosqlite.Row:
-    row["completed_at"] = datetime.now().isoformat()
-    row["created_at"] = datetime(2023, 1, 1, 10, 0, 0).isoformat()
-    return row
+def row_with_dates() -> RetryMediaRow:
+    return RetryMediaRow(
+        referer=_MOCK_ROW.referer,
+        download_path=_MOCK_ROW.download_path,
+        completed_at=datetime.now(),
+        created_at=datetime(2023, 1, 1, 10, 0, 0),
+    )
 
 
-def test_scrape_item_creation(row: aiosqlite.Row) -> None:
+def test_scrape_item_creation(row: RetryMediaRow) -> None:
     item = _create_item_from_row(row)
     assert isinstance(item, ScrapeItem)
     assert item.url == AbsoluteHttpURL("https://drive.google.com/file/d/1F0YBsnQRvrMbK0p9UlnyLu88kqQ0j_F6/edit")
@@ -51,18 +56,28 @@ def test_scrape_item_creation(row: aiosqlite.Row) -> None:
 
 
 def test_item_with_completed_at(row_with_dates) -> None:
-    completed_at_str = row_with_dates["completed_at"]
-    row_with_dates["created_at"] = None
+    completed_at = row_with_dates.completed_at
+    row = RetryMediaRow(
+        referer=row_with_dates.referer,
+        download_path=row_with_dates.download_path,
+        completed_at=completed_at,
+        created_at=None,
+    )
 
-    item = _create_item_from_row(row_with_dates)
-    expected_timestamp = int(datetime.fromisoformat(completed_at_str).timestamp())
+    item = _create_item_from_row(row)
+    expected_timestamp = int(completed_at.timestamp())
     assert item.completed_at == expected_timestamp
     assert item.created_at is None
 
 
 def test_item_with_created_at(row) -> None:
     now = datetime.now()
-    row["created_at"] = now.isoformat()
+    row = RetryMediaRow(
+        referer=row.referer,
+        download_path=row.download_path,
+        completed_at=row.completed_at,
+        created_at=now,
+    )
 
     item = _create_item_from_row(row)
     assert item.created_at == int(now.timestamp())
@@ -70,27 +85,31 @@ def test_item_with_created_at(row) -> None:
 
 
 def test_item_with_both_dates(row_with_dates) -> None:
-    completed_at_str = row_with_dates["completed_at"]
-    created_at_str = row_with_dates["created_at"]
-
     item = _create_item_from_row(row_with_dates)
-    expected_completed_timestamp = int(datetime.fromisoformat(completed_at_str).timestamp())
-    expected_created_timestamp = int(datetime.fromisoformat(created_at_str).timestamp())
+    expected_completed_timestamp = int(row_with_dates.completed_at.timestamp())
+    expected_created_timestamp = int(row_with_dates.created_at.timestamp())
     assert item.completed_at == expected_completed_timestamp
     assert item.created_at == expected_created_timestamp
 
 
 def test_missing_download_path(row) -> None:
-    del row["download_path"]
-
-    with pytest.raises(KeyError, match="download_path"):
-        _create_item_from_row(row)
+    with pytest.raises(TypeError, match="download_path"):
+        _ = RetryMediaRow(
+            referer=row.referer,
+            completed_at=row.completed_at,
+            created_at=row.created_at,
+        )
 
 
 def test_invalid_date_format(row) -> None:
-    row["completed_at"] = "invalid date"
+    row = RetryMediaRow(
+        referer=row.referer,
+        download_path=row.download_path,
+        completed_at="invalid date",  # type: ignore[arg-type]
+        created_at=row.created_at,
+    )
 
-    with pytest.raises(ValueError):
+    with pytest.raises(AttributeError):
         _create_item_from_row(row)
 
 

@@ -33,7 +33,7 @@ class Sorter:
         self.download_folder = manager.path_manager.scan_folder or manager.path_manager.download_folder
         self.sorted_folder = manager.path_manager.sorted_folder
         self.incrementer_format: str = manager.config_manager.settings_data.sorting.sort_incrementer_format
-        self.db_manager = manager.db_manager
+        self.db_manager = manager.database
 
         settings = manager.config_manager.settings_data.sorting
         self.audio_format: str | None = settings.sorted_audio

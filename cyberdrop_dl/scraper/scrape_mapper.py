@@ -28,8 +28,7 @@ from cyberdrop_dl.utils.utilities import get_download_path, remove_trailing_slas
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Generator
 
-    import aiosqlite
-
+    from cyberdrop_dl.database import RetryMediaRow
     from cyberdrop_dl.config.global_model import GenericCrawlerInstances, GlobalSettings
     from cyberdrop_dl.crawlers import Crawler
     from cyberdrop_dl.managers.manager import Manager
@@ -101,7 +100,7 @@ class ScrapeMapper:
     async def run(self) -> None:
         """Starts the orchestra."""
         self.start_scrapers()
-        await self.manager.db_manager.history_table.update_previously_unsupported(self.existing_crawlers)
+        await self.manager.database.update_previously_unsupported(self.existing_crawlers)
         self.jdownloader.connect()
         await self.start_real_debrid()
         self.direct_crawler._init_downloader()
@@ -183,7 +182,7 @@ class ScrapeMapper:
 
     async def load_failed_links(self) -> AsyncGenerator[ScrapeItem]:
         """Loads failed links from database."""
-        async for rows in self.manager.db_manager.history_table.get_failed_items():
+        async for rows in self.manager.database.get_failed_media_items():
             for row in rows:
                 yield _create_item_from_row(row)
 
@@ -191,13 +190,13 @@ class ScrapeMapper:
         """Loads all links from database."""
         after = self.manager.parsed_args.cli_only_args.completed_after or date.min
         before = self.manager.parsed_args.cli_only_args.completed_before or datetime.now().date()
-        async for rows in self.manager.db_manager.history_table.get_all_items(after, before):
+        async for rows in self.manager.database.get_all_media_items(after, before):
             for row in rows:
                 yield _create_item_from_row(row)
 
     async def load_all_bunkr_failed_links_via_hash(self) -> AsyncGenerator[ScrapeItem]:
         """Loads all bunkr links with maintenance hash."""
-        async for rows in self.manager.db_manager.history_table.get_all_bunkr_failed():
+        async for rows in self.manager.database.get_all_bunkr_failed():
             for row in rows:
                 yield _create_item_from_row(row)
 
@@ -346,14 +345,14 @@ def regex_links(line: str) -> Generator[AbsoluteHttpURL]:
             log(f"Unable to parse URL from input file: {link} {e:!r}", 40)
 
 
-def _create_item_from_row(row: aiosqlite.Row) -> ScrapeItem:
-    referer: str = row["referer"]
+def _create_item_from_row(row: RetryMediaRow) -> ScrapeItem:
+    referer = row.referer
     url = AbsoluteHttpURL(referer, encoded="%" in referer)
-    item = ScrapeItem(url=url, retry_path=Path(row["download_path"]), part_of_album=True)
-    if completed_at := row["completed_at"]:
-        item.completed_at = int(datetime.fromisoformat(completed_at).timestamp())
-    if created_at := row["created_at"]:
-        item.created_at = int(datetime.fromisoformat(created_at).timestamp())
+    item = ScrapeItem(url=url, retry_path=Path(row.download_path), part_of_album=True)
+    if completed_at := row.completed_at:
+        item.completed_at = int(completed_at.timestamp())
+    if created_at := row.created_at:
+        item.created_at = int(created_at.timestamp())
     return item
 
 
