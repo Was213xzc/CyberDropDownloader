@@ -240,6 +240,7 @@ class CompressionManager:
             self._pending_paths.add(key)
             await asyncio.to_thread(self._write_pending_file, sorted(self._pending_paths))
         self._notify_pending_count()
+        self._notify_total_increment(1)
 
     async def _untrack_pending(self, path: Path) -> None:
         key = self._pending_key(path)
@@ -293,6 +294,7 @@ class CompressionManager:
         self._pending_paths.update(resumable)
         self._write_pending_file(sorted(self._pending_paths))
         self._notify_pending_count()
+        self._notify_total_increment(len(resumable))
         log(f"Resuming {len(resumable)} pending compression(s) from previous session", 20)
         self._producer_started()
         try:
@@ -367,6 +369,14 @@ class CompressionManager:
         if progress is None:
             return
         progress.set_pending_count(len(self._pending_paths))
+
+    def _notify_total_increment(self, delta: int) -> None:
+        if delta <= 0:
+            return
+        progress = self._compression_progress()
+        if progress is None or not hasattr(progress, "increment_total"):
+            return
+        progress.increment_total(delta)
 
     def _compression_progress(self):
         progress_manager = getattr(self.manager, "progress_manager", None)

@@ -42,26 +42,45 @@ class CompressionProgress:
         if manager.parsed_args.cli_only_args.portrait:
             use_columns = vertical_columns
         self._active_progress = Progress(*use_columns, expand=True)
-        self._summary_progress = Progress("{task.description}", expand=True)
-        self._summary_task = self._summary_progress.add_task("[dim]Idle")
+        self._queue_progress = Progress(
+            "[progress.description]{task.description}",
+            BarColumn(bar_width=None),
+            "[progress.percentage]{task.percentage:>6.2f}%",
+            "━",
+            "{task.completed:,}",
+            expand=True,
+        )
+        self._pending_task = self._queue_progress.add_task("[cyan]Pending", total=0, completed=0)
+        self._compressed_task = self._queue_progress.add_task("[green]Compressed", total=0, completed=0)
+        self._skipped_task = self._queue_progress.add_task("[yellow]Skipped", total=0, completed=0)
+        self._failed_task = self._queue_progress.add_task("[red]Failed", total=0, completed=0)
         self._worker_tasks: dict[int, TaskID] = {}
         self._pending = 0
-        self._results = {"compressed": 0, "skipped": 0, "failed": 0}
-
-    def get_renderable(self) -> Panel:
-        return Panel(
-            Group(self._active_progress, self._summary_progress),
+        self._compressed = 0
+        self._skipped = 0
+        self._failed = 0
+        self._total = 0
+        self._panel = Panel(
+            Group(self._active_progress, self._queue_progress),
             title=f"Compression (config: {self.manager.config_manager.loaded_config})",
             border_style="magenta",
             padding=(0, 1),
+            subtitle=f"Total: [white]{self._total:,}",
         )
+
+    def get_renderable(self) -> Panel:
+        return self._panel
 
     def set_pending_count(self, count: int) -> None:
         self._pending = max(0, count)
-        self._refresh_summary()
+        self._refresh_queue_stats()
 
     def increment_pending(self, delta: int = 1) -> None:
         self.set_pending_count(self._pending + delta)
+
+    def increment_total(self, delta: int = 1) -> None:
+        self._total = max(0, self._total + delta)
+        self._refresh_queue_stats()
 
     def set_current(self, worker_id: int, path: Path | None) -> None:
         if path is None:
@@ -70,17 +89,21 @@ class CompressionProgress:
                 self._active_progress.remove_task(task_id)
         else:
             self._ensure_worker_task(worker_id, path)
-        self._refresh_summary()
 
     def add_result(self, status: str) -> None:
-        if status in self._results:
-            self._results[status] += 1
-            self._refresh_summary()
+        if status == "compressed":
+            self._compressed += 1
+        elif status == "skipped":
+            self._skipped += 1
+        elif status == "failed":
+            self._failed += 1
+        else:
+            return
+        self._refresh_queue_stats()
 
     def start_task(self, worker_id: int, path: Path, total: int) -> None:
         task_id = self._ensure_worker_task(worker_id, path)
         self._active_progress.update(task_id, completed=0, total=max(total, 1), visible=True)
-        self._refresh_summary()
 
     def update_task(self, worker_id: int, completed: int, total: int | None = None) -> None:
         task_id = self._worker_tasks.get(worker_id)
@@ -114,18 +137,15 @@ class CompressionProgress:
         clean_name = name.encode("ascii", "ignore").decode().strip()
         return f"[cyan]#{worker_id}[/cyan] [blue]{escape(adjust_title(clean_name, length=40))}[/blue]"
 
-    def _refresh_summary(self) -> None:
-        active = len(self._worker_tasks)
-        if active == 0 and self._pending == 0 and not any(self._results.values()):
-            self._summary_progress.update(self._summary_task, description="[dim]Idle")
-            return
-        self._summary_progress.update(
-            self._summary_task,
-            description=(
-                f"[cyan]Active:[/cyan] {active}  "
-                f"[cyan]Pending:[/cyan] {self._pending}  "
-                f"[green]Compressed:[/green] {self._results['compressed']}  "
-                f"[yellow]Skipped:[/yellow] {self._results['skipped']}  "
-                f"[red]Failed:[/red] {self._results['failed']}"
-            ),
-        )
+    def _refresh_queue_stats(self) -> None:
+        # Total can lag briefly during transitions — grow it to match whatever is
+        # currently accounted for so bar percentages never exceed 100%.
+        accounted = self._pending + self._compressed + self._skipped + self._failed
+        if accounted > self._total:
+            self._total = accounted
+        total = self._total
+        self._queue_progress.update(self._pending_task, total=total, completed=self._pending)
+        self._queue_progress.update(self._compressed_task, total=total, completed=self._compressed)
+        self._queue_progress.update(self._skipped_task, total=total, completed=self._skipped)
+        self._queue_progress.update(self._failed_task, total=total, completed=self._failed)
+        self._panel.subtitle = f"Total: [white]{total:,}"

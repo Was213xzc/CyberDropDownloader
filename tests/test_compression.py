@@ -971,6 +971,7 @@ def test_download_lifecycle_enqueues_after_rename_and_duration_check() -> None:
 class FakeCompressionProgress:
     def __init__(self) -> None:
         self.pending_count = 0
+        self.total = 0
         self.current: dict[int, Path] = {}
         self.results: list[str] = []
         self.started: list[tuple[int, Path, int]] = []
@@ -979,6 +980,9 @@ class FakeCompressionProgress:
 
     def set_pending_count(self, count: int) -> None:
         self.pending_count = count
+
+    def increment_total(self, delta: int = 1) -> None:
+        self.total = max(0, self.total + delta)
 
     def set_current(self, worker_id: int, path: Path | None) -> None:
         if path is None:
