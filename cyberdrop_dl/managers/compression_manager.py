@@ -112,6 +112,7 @@ class CompressionManager:
 
     async def close(self) -> None:
         await self.join()
+        self._queue_tasks = [task for task in self._queue_tasks if not task.done()]
         if not self._queue_tasks:
             return
 
@@ -184,11 +185,27 @@ class CompressionManager:
     async def _run_queue_worker(self, worker_id: int) -> None:
         while True:
             item = await self._queue.get()
+            if item is None:
+                self._queue.task_done()
+                return
+
+            process_task = asyncio.create_task(self._process_queue_item(item, worker_id))
             try:
-                if item is None:
-                    return
-                await self._process_queue_item(item, worker_id)
-            finally:
+                await asyncio.shield(process_task)
+            except asyncio.CancelledError:
+                log(
+                    f"Compression worker #{worker_id} cancellation deferred until {item.media_item.complete_file} finishes",
+                    30,
+                )
+                try:
+                    await process_task
+                finally:
+                    self._queue.task_done()
+                raise
+            except BaseException:
+                self._queue.task_done()
+                raise
+            else:
                 self._queue.task_done()
 
     async def _process_queue_item(self, item: CompressionQueueItem, worker_id: int) -> None:
@@ -556,7 +573,15 @@ class CompressionManager:
             json.dumps(self._pynv_transcode_kwargs(codec, cq)),
             **kwargs,
         )
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await process.communicate()
+        except BaseException:
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    process.kill()
+                with contextlib.suppress(ProcessLookupError, OSError, asyncio.TimeoutError):
+                    await asyncio.wait_for(process.wait(), timeout=5)
+            raise
         if process.returncode:
             output = (stderr or stdout).decode("utf8", errors="replace").strip()
             raise RuntimeError(_format_pynv_worker_failure(process.returncode, output))

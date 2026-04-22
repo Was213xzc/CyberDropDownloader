@@ -1238,6 +1238,67 @@ def test_join_waits_for_in_flight_enqueue_before_returning() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_worker_cancellation_waits_for_active_item_before_join_returns() -> None:
+    root = _reset_test_dir()
+    try:
+        pending_file = root / "compression_pending.json"
+        owner = _owner_with_pending_file(pending_file, CompressionOptions(gpu_ids=[0], video_workers_per_gpu=1))
+        compression_manager = CompressionManager(cast("Any", owner))
+        media_path = root / "media.mp4"
+        media_path.write_bytes(b"data")
+        started = asyncio.Event()
+        release = asyncio.Event()
+        completed: list[str] = []
+
+        async def fake_compress(media_item: MediaItem) -> None:
+            started.set()
+            await release.wait()
+            completed.append("compress")
+
+        async def noop_process(media_item: MediaItem, domain: str) -> None:
+            completed.append("process")
+
+        async def noop_handle(media_item: MediaItem, downloaded: bool = True) -> None:
+            completed.append("handle")
+
+        compression_manager.compress_media_item = fake_compress
+        media_item = cast(
+            "MediaItem",
+            SimpleNamespace(
+                complete_file=media_path,
+                filename="media.mp4",
+                is_segment=False,
+            ),
+        )
+
+        async def run() -> None:
+            await compression_manager.enqueue_completed_download(
+                "example.com",
+                media_item,
+                noop_process,
+                noop_handle,
+            )
+            worker = compression_manager._queue_tasks[0]
+            await asyncio.wait_for(started.wait(), timeout=1)
+            join_task = asyncio.create_task(compression_manager.join())
+            worker.cancel()
+            await asyncio.sleep(0)
+            assert not join_task.done()
+            assert compression_manager._read_pending_file() == [str(media_path)]
+            release.set()
+            await asyncio.wait_for(join_task, timeout=1)
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(worker, timeout=1)
+            await compression_manager.close()
+
+        asyncio.run(run())
+
+        assert completed == ["compress", "process", "handle"]
+        assert compression_manager._read_pending_file() == []
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_resume_handles_empty_pending_file_without_errors() -> None:
     root = _reset_test_dir()
     try:
