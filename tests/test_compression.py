@@ -968,6 +968,110 @@ def test_download_lifecycle_enqueues_after_rename_and_duration_check() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_download_collision_is_treated_as_previously_downloaded() -> None:
+    root = _reset_test_dir()
+    try:
+        partial_file = root / "download.jpg.part"
+        complete_file = root / "download.jpg"
+        partial_file.write_text("downloaded", encoding="utf8")
+        complete_file.write_text("downloaded", encoding="utf8")
+        calls: list[str] = []
+
+        class FakeDownloadProgress:
+            def __init__(self) -> None:
+                self.args: list[bool] = []
+
+            def add_previously_completed(self, increase_total: bool = True) -> None:
+                self.args.append(increase_total)
+
+        class FakeClientManager:
+            def __init__(self, manager: Any) -> None:
+                self.manager = manager
+
+            @contextlib.contextmanager
+            def request_context(self, domain: str):
+                yield
+
+            async def check_file_duration(self, media_item: MediaItem) -> bool:
+                calls.append("duration")
+                return True
+
+        class FakeCompressionManager:
+            async def enqueue_existing_file_if_needed(
+                self,
+                domain: str,
+                media_item: MediaItem,
+                process_completed: Any,
+                handle_completion: Any,
+                *,
+                downloaded: bool = False,
+                allow_images: bool = True,
+            ) -> bool:
+                calls.append("enqueue")
+                assert domain == "example.com"
+                assert downloaded is False
+                assert media_item.complete_file == complete_file
+                return True
+
+        running = asyncio.Event()
+        running.set()
+        progress = SimpleNamespace(download_progress=FakeDownloadProgress())
+        manager = SimpleNamespace(
+            config=ConfigSettings(),
+            config_manager=SimpleNamespace(settings_data=ConfigSettings()),
+            states=SimpleNamespace(RUNNING=running),
+            database=SimpleNamespace(),
+            compression_manager=FakeCompressionManager(),
+            progress_manager=progress,
+        )
+        client_manager = FakeClientManager(manager)
+        client = DownloadClient(cast("Any", manager), cast("Any", client_manager))
+
+        async def fake_download(domain: str, media_item: MediaItem) -> bool:
+            calls.append("download")
+            return True
+
+        async def fake_promote_partial_to_complete(media_item: MediaItem) -> None:
+            raise FileExistsError(
+                183,
+                "Cannot create a file when that file already exists",
+                str(media_item.complete_file),
+            )
+
+        async def fake_process_completed(media_item: MediaItem, domain: str) -> None:
+            calls.append("process_completed")
+
+        async def fake_handle_completion(media_item: MediaItem, downloaded: bool = False) -> None:
+            calls.append(f"handle_completion:{downloaded}")
+
+        client._download = fake_download
+        client._promote_partial_to_complete = fake_promote_partial_to_complete
+        client.process_completed = fake_process_completed
+        client.handle_media_item_completion = fake_handle_completion
+        media_item = cast(
+            "MediaItem",
+            SimpleNamespace(
+                complete_file=complete_file,
+                is_segment=False,
+                partial_file=partial_file,
+                url="https://example.com/download.jpg",
+                referer="https://example.com/post",
+                filesize=len("downloaded"),
+            ),
+        )
+
+        assert asyncio.run(client.download_file("example.com", media_item)) is False
+        assert calls == [
+            "download",
+            "enqueue",
+        ]
+        assert progress.download_progress.args == [False]
+        assert complete_file.read_text(encoding="utf8") == "downloaded"
+        assert not partial_file.exists()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 class FakeCompressionProgress:
     def __init__(self) -> None:
         self.pending_count = 0

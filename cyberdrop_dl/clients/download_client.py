@@ -149,18 +149,7 @@ class DownloadClient:
                 if media_item.is_segment:
                     return True
                 log(f"Skipping {media_item.url} as it has already been downloaded", 10)
-                self.manager.progress_manager.download_progress.add_previously_completed(False)
-                queued = await self.manager.compression_manager.enqueue_existing_file_if_needed(
-                    domain,
-                    media_item,
-                    self.process_completed,
-                    self.handle_media_item_completion,
-                    downloaded=False,
-                )
-                if not queued:
-                    await self.process_completed(media_item, domain)
-                    await self.handle_media_item_completion(media_item, downloaded=False)
-
+                await self._mark_previously_downloaded(domain, media_item)
                 return False
             if await self.check_duplicate_filename_size(domain, media_item):
                 log(
@@ -168,18 +157,8 @@ class DownloadClient:
                     "with the same file size has already been downloaded",
                 10,
                 )
-                self.manager.progress_manager.download_progress.add_previously_completed(False)
                 self.manager.log_manager.write_skipped_duplicate_url_log(media_item)
-                queued = await self.manager.compression_manager.enqueue_existing_file_if_needed(
-                    domain,
-                    media_item,
-                    self.process_completed,
-                    self.handle_media_item_completion,
-                    downloaded=False,
-                )
-                if not queued:
-                    await self.process_completed(media_item, domain)
-                    await self.handle_media_item_completion(media_item, downloaded=False)
+                await self._mark_previously_downloaded(domain, media_item)
                 return False
 
         if resp.status != HTTPStatus.PARTIAL_CONTENT:
@@ -362,7 +341,12 @@ class DownloadClient:
             downloaded = await self._download(domain, media_item)
 
         if downloaded:
-            await asyncio.to_thread(media_item.partial_file.rename, media_item.complete_file)
+            try:
+                await self._promote_partial_to_complete(media_item)
+            except FileExistsError:
+                if await self._handle_existing_destination_collision(domain, media_item):
+                    return False
+                raise
             if not media_item.is_segment:
                 proceed = await self.client_manager.check_file_duration(media_item)
                 if not proceed:
@@ -382,6 +366,37 @@ class DownloadClient:
         return downloaded
 
     """~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"""
+
+    async def _promote_partial_to_complete(self, media_item: MediaItem) -> None:
+        await asyncio.to_thread(media_item.partial_file.rename, media_item.complete_file)
+
+    async def _mark_previously_downloaded(self, domain: str, media_item: MediaItem) -> None:
+        self.manager.progress_manager.download_progress.add_previously_completed(False)
+        queued = await self.manager.compression_manager.enqueue_existing_file_if_needed(
+            domain,
+            media_item,
+            self.process_completed,
+            self.handle_media_item_completion,
+            downloaded=False,
+        )
+        if not queued:
+            await self.process_completed(media_item, domain)
+            await self.handle_media_item_completion(media_item, downloaded=False)
+
+    async def _handle_existing_destination_collision(self, domain: str, media_item: MediaItem) -> bool:
+        complete_size = await aio.get_size(media_item.complete_file)
+        partial_size = await aio.get_size(media_item.partial_file)
+        known_sizes = {size for size in (partial_size, media_item.filesize) if size is not None}
+        if complete_size is None or not known_sizes or complete_size not in known_sizes:
+            return False
+
+        log(
+            f"Treating {media_item.complete_file.name} as previously downloaded because the final file already exists",
+            10,
+        )
+        await aio.unlink(media_item.partial_file, missing_ok=True)
+        await self._mark_previously_downloaded(domain, media_item)
+        return True
 
     async def mark_incomplete(self, media_item: MediaItem, domain: str) -> None:
         """Marks the media item as incomplete in the database."""
