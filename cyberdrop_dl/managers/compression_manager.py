@@ -211,6 +211,7 @@ class CompressionManager:
     async def _process_queue_item(self, item: CompressionQueueItem, worker_id: int) -> None:
         source_path = Path(item.media_item.complete_file)
         self._notify_current(worker_id, source_path)
+        progress_tracking = await self._start_progress_tracking(worker_id, source_path)
         try:
             try:
                 await self.compress_media_item(item.media_item)
@@ -225,6 +226,7 @@ class CompressionManager:
             except Exception as e:
                 log(f"Post-download completion failed for {source_path}: {e}", 40, exc_info=True)
         finally:
+            await self._stop_progress_tracking(worker_id, progress_tracking)
             self._notify_current(worker_id, None)
             await self._untrack_pending(source_path)
             if item.completion_lock is not None and item.completion_lock.locked():
@@ -342,6 +344,24 @@ class CompressionManager:
             return
         progress.set_current(worker_id, path)
 
+    def _notify_task_started(self, worker_id: int, path: Path, total: int) -> None:
+        progress = self._compression_progress()
+        if progress is None or not hasattr(progress, "start_task"):
+            return
+        progress.start_task(worker_id, path, total)
+
+    def _notify_task_progress(self, worker_id: int, completed: int, total: int) -> None:
+        progress = self._compression_progress()
+        if progress is None or not hasattr(progress, "update_task"):
+            return
+        progress.update_task(worker_id, completed, total)
+
+    def _notify_task_finished(self, worker_id: int) -> None:
+        progress = self._compression_progress()
+        if progress is None or not hasattr(progress, "finish_task"):
+            return
+        progress.finish_task(worker_id)
+
     def _notify_pending_count(self) -> None:
         progress = self._compression_progress()
         if progress is None:
@@ -351,6 +371,82 @@ class CompressionManager:
     def _compression_progress(self):
         progress_manager = getattr(self.manager, "progress_manager", None)
         return getattr(progress_manager, "compression_progress", None)
+
+    async def _start_progress_tracking(
+        self, worker_id: int, source_path: Path
+    ) -> tuple[asyncio.Event, asyncio.Task[None], int] | None:
+        total = await asyncio.to_thread(self._compression_total_size, source_path)
+        if total is None or not self._should_track_progress(source_path):
+            return None
+
+        self._notify_task_started(worker_id, source_path, total)
+        stop_event = asyncio.Event()
+        monitor_task = asyncio.create_task(
+            self._monitor_compression_progress(worker_id, source_path, total, stop_event),
+            name=f"cyberdrop-compression-progress-{worker_id}",
+        )
+        return stop_event, monitor_task, total
+
+    async def _stop_progress_tracking(
+        self,
+        worker_id: int,
+        progress_tracking: tuple[asyncio.Event, asyncio.Task[None], int] | None,
+    ) -> None:
+        if progress_tracking is None:
+            return
+
+        stop_event, monitor_task, total = progress_tracking
+        stop_event.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await monitor_task
+        self._notify_task_progress(worker_id, total, total)
+        self._notify_task_finished(worker_id)
+
+    async def _monitor_compression_progress(
+        self,
+        worker_id: int,
+        source_path: Path,
+        total: int,
+        stop_event: asyncio.Event,
+    ) -> None:
+        temp_output = self._temp_output_template(source_path)
+        while True:
+            current_size = await asyncio.to_thread(self._current_compression_output_size, temp_output)
+            self._notify_task_progress(worker_id, min(current_size, total), total)
+            if stop_event.is_set():
+                return
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+
+    @staticmethod
+    def _compression_total_size(source_path: Path) -> int | None:
+        try:
+            return source_path.stat().st_size
+        except OSError:
+            return None
+
+    def _should_track_progress(self, source_path: Path) -> bool:
+        options = self.options
+        ext = source_path.suffix.lower()
+        return (options.compress_videos and ext in FILE_FORMATS["Videos"]) or (
+            options.compress_images and ext in FILE_FORMATS["Images"]
+        )
+
+    @staticmethod
+    def _temp_output_template(source_path: Path) -> Path:
+        return source_path.with_name(f"{source_path.stem}.compressed{source_path.suffix}")
+
+    def _current_compression_output_size(self, temp_output: Path) -> int:
+        largest = 0
+        for path in self._temp_output_cleanup_candidates(temp_output):
+            try:
+                if path.is_file():
+                    largest = max(largest, path.stat().st_size)
+            except OSError:
+                continue
+        return largest
 
     async def _should_enqueue_existing_file(self, media_item: MediaItem, *, allow_images: bool) -> bool:
         options = self.options
@@ -430,7 +526,7 @@ class CompressionManager:
         if pynv is None:
             return CompressionResult(status="skipped", error="PyNvVideoCodec is not installed", **result_kwargs)
 
-        temp_output_template = source.with_name(f"{source.stem}.compressed{source.suffix}")
+        temp_output_template = self._temp_output_template(source)
         errors: list[str] = []
         cq_attempts = self._video_cq_attempts(codec)
         for attempt_cq in cq_attempts:
@@ -464,7 +560,7 @@ class CompressionManager:
 
     async def _compress_image(self, source: Path) -> CompressionResult:
         result_kwargs = {"media_type": "image", "backend": "pillow", "path": source}
-        temp_output = source.with_name(f"{source.stem}.compressed{source.suffix}")
+        temp_output = self._temp_output_template(source)
         try:
             await self._delete_temp(temp_output)
             await asyncio.to_thread(self._save_image_optimized, source, temp_output)

@@ -973,6 +973,9 @@ class FakeCompressionProgress:
         self.pending_count = 0
         self.current: dict[int, Path] = {}
         self.results: list[str] = []
+        self.started: list[tuple[int, Path, int]] = []
+        self.updates: list[tuple[int, int, int | None]] = []
+        self.finished: list[int] = []
 
     def set_pending_count(self, count: int) -> None:
         self.pending_count = count
@@ -985,6 +988,15 @@ class FakeCompressionProgress:
 
     def add_result(self, status: str) -> None:
         self.results.append(status)
+
+    def start_task(self, worker_id: int, path: Path, total: int) -> None:
+        self.started.append((worker_id, path, total))
+
+    def update_task(self, worker_id: int, completed: int, total: int | None = None) -> None:
+        self.updates.append((worker_id, completed, total))
+
+    def finish_task(self, worker_id: int) -> None:
+        self.finished.append(worker_id)
 
 
 class FakePathManager:
@@ -1170,6 +1182,58 @@ def test_queue_worker_notifies_current_file_and_pending_count() -> None:
         assert progress.pending_count == 0
         assert progress.current == {}
         assert compression_manager._read_pending_file() == []
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_queue_worker_reports_live_compression_progress() -> None:
+    root = _reset_test_dir()
+    try:
+        pending_file = root / "compression_pending.json"
+        owner = _owner_with_pending_file(pending_file, CompressionOptions(gpu_ids=[0], video_workers_per_gpu=1))
+        compression_manager = CompressionManager(cast("Any", owner))
+        media_path = root / "media.mp4"
+        media_path.write_bytes(b"x" * 100)
+        progress = owner.progress_manager.compression_progress
+
+        async def fake_compress(media_item: MediaItem) -> None:
+            temp_output = media_path.with_name(f"{media_path.stem}.compressed{media_path.suffix}")
+            await asyncio.to_thread(temp_output.write_bytes, b"x" * 25)
+            await asyncio.sleep(0.6)
+            await asyncio.to_thread(temp_output.write_bytes, b"x" * 50)
+            await asyncio.sleep(0.6)
+
+        async def noop_process(media_item: MediaItem, domain: str) -> None:
+            return None
+
+        async def noop_handle(media_item: MediaItem, downloaded: bool = True) -> None:
+            return None
+
+        compression_manager.compress_media_item = fake_compress
+        media_item = cast(
+            "MediaItem",
+            SimpleNamespace(
+                complete_file=media_path,
+                filename="media.mp4",
+                is_segment=False,
+            ),
+        )
+
+        async def run() -> None:
+            await compression_manager.enqueue_completed_download(
+                "example.com",
+                media_item,
+                noop_process,
+                noop_handle,
+            )
+            await compression_manager.join()
+            await compression_manager.close()
+
+        asyncio.run(run())
+
+        assert progress.started == [(1, media_path, 100)]
+        assert any(update[0] == 1 and update[1] >= 25 and update[2] == 100 for update in progress.updates)
+        assert 1 in progress.finished
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
