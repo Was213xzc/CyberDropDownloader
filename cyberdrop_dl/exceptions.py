@@ -267,6 +267,8 @@ def _classify_unknown_error(message: str) -> str | None:
         return CURL_ERROR_CODES.get(code, f"cURL Error ({code})")
 
     lowered = message.lower()
+    if "cannot create a file when that file already exists" in lowered or "file already exists" in lowered:
+        return "Destination File Exists"
     if "timed out" in lowered or "timeout" in lowered:
         return "Timeout"
 
