@@ -123,9 +123,9 @@ async def _post_runtime(manager: Manager) -> None:
     """Actions to complete after main runtime, and before ui shutdown."""
     log_spacer(20, log_to_console=False)
     msg = f"Running Post-Download Processes For Config: {manager.config_manager.loaded_config}"
-    log_with_color(msg, "green", 20)
-
-    await manager.compression_manager.join()
+    with manager.live_manager.get_main_live(stop=True):
+        log_with_color(msg, "green", 20)
+        await manager.compression_manager.join()
     await manager.hash_manager.hash_client.cleanup_dupes_after_download()
 
     if manager.config_manager.settings_data.sorting.sort_downloads and not manager.parsed_args.cli_only_args.retry_any:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+from contextlib import contextmanager
 from dataclasses import Field
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 import pytest
 
+import cyberdrop_dl.director as director
 from cyberdrop_dl.data_structures import AbsoluteHttpURL
 from cyberdrop_dl.managers.log_manager import LogManager
 from cyberdrop_dl.managers.manager import Manager, merge_dicts
@@ -157,3 +159,59 @@ def test_skipped_duplicate_urls_log_is_urls_txt() -> None:
         assert log_manager.skipped_duplicate_urls_log.read_text(encoding="utf8") == f"{url}\n"
     finally:
         shutil.rmtree(log_folder, ignore_errors=True)
+
+
+def test_post_runtime_keeps_main_live_open_during_compression_join(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+    main_live_active = False
+
+    @contextmanager
+    def fake_main_live(*, stop: bool = False):
+        nonlocal main_live_active
+        events.append(f"enter:{stop}")
+        main_live_active = True
+        try:
+            yield None
+        finally:
+            main_live_active = False
+            events.append(f"exit:{stop}")
+
+    class FakeCompressionManager:
+        async def join(self) -> None:
+            events.append(f"join:{main_live_active}")
+
+    class FakeHashClient:
+        async def cleanup_dupes_after_download(self) -> None:
+            events.append(f"cleanup:{main_live_active}")
+
+    async def fake_update_last_forum_post() -> None:
+        events.append("update_last_forum_post")
+
+    monkeypatch.setattr(director, "log_spacer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(director, "log_with_color", lambda *args, **kwargs: None)
+    monkeypatch.setattr(director, "check_partials_and_empty_folders", lambda manager: events.append("partials"))
+
+    manager = SimpleNamespace(
+        live_manager=SimpleNamespace(get_main_live=fake_main_live),
+        config_manager=SimpleNamespace(
+            loaded_config="Default",
+            settings_data=SimpleNamespace(
+                sorting=SimpleNamespace(sort_downloads=False),
+                runtime_options=SimpleNamespace(update_last_forum_post=False),
+            ),
+        ),
+        parsed_args=SimpleNamespace(cli_only_args=SimpleNamespace(retry_any=False)),
+        compression_manager=FakeCompressionManager(),
+        hash_manager=SimpleNamespace(hash_client=FakeHashClient()),
+        log_manager=SimpleNamespace(update_last_forum_post=fake_update_last_forum_post),
+    )
+
+    asyncio.run(director._post_runtime(manager))
+
+    assert events == [
+        "enter:True",
+        "join:True",
+        "exit:True",
+        "cleanup:False",
+        "partials",
+    ]
