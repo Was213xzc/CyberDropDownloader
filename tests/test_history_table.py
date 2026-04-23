@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from pathlib import Path
 
@@ -72,6 +73,29 @@ async def test_get_media_item_creates_missing_row_and_returns_existing_row_uncha
         assert existing.original_filename == "one.mp4"
         assert existing.album_id == "album-1"
         assert existing.completed is False
+    finally:
+        await database.close()
+
+
+async def test_concurrent_get_media_item_creates_single_row(tmp_path: Path) -> None:
+    database, _ = await _create_database(tmp_path)
+    key = MediaLookupKey(
+        domain="bunkr",
+        db_path="/concurrent.mp4",
+        referer="https://bunkr.site/a/album-1",
+        original_filename="concurrent.mp4",
+    )
+    defaults = MediaDefaults(
+        download_path=str(tmp_path / "downloads"),
+        original_filename="concurrent.mp4",
+        album_id="album-1",
+    )
+
+    try:
+        rows = await asyncio.gather(*(database.get_media_item(key, defaults) for _ in range(40)))
+
+        assert len({row.id for row in rows}) == 1
+        assert rows[0].original_filename == "concurrent.mp4"
     finally:
         await database.close()
 

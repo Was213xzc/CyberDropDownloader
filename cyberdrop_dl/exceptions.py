@@ -267,6 +267,10 @@ def _classify_unknown_error(message: str) -> str | None:
         return CURL_ERROR_CODES.get(code, f"cURL Error ({code})")
 
     lowered = message.lower()
+    if "database is locked" in lowered:
+        return "Database Locked"
+    if "queuepool limit" in lowered and "connection timed out" in lowered:
+        return "Database Timeout"
     if "cannot create a file when that file already exists" in lowered or "file already exists" in lowered:
         return "Destination File Exists"
     if "timed out" in lowered or "timeout" in lowered:

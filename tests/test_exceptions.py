@@ -31,6 +31,31 @@ def test_windows_file_exists_collision_is_classified_clearly() -> None:
     assert "WinError 183" in result.main_log_msg
 
 
+def test_sqlite_database_locked_is_classified_clearly() -> None:
+    error = FakeUnknownError(
+        "(sqlite3.OperationalError) database is locked\n"
+        "[SQL: INSERT INTO media_items (...)]"
+    )
+
+    result = ErrorLogMessage.from_unknown_exc(error)
+
+    assert result.ui_failure == "Database Locked"
+    assert result.csv_log_msg == "Database Locked"
+    assert "database is locked" in result.main_log_msg
+
+
+def test_sqlalchemy_pool_timeout_is_classified_as_database_timeout() -> None:
+    error = FakeUnknownError(
+        "QueuePool limit of size 5 overflow 10 reached, connection timed out, timeout 30.00"
+    )
+
+    result = ErrorLogMessage.from_unknown_exc(error)
+
+    assert result.ui_failure == "Database Timeout"
+    assert result.csv_log_msg == "Database Timeout"
+    assert "QueuePool limit" in result.main_log_msg
+
+
 def test_unclassified_unknown_error_still_points_to_logs() -> None:
     result = ErrorLogMessage.from_unknown_exc(FakeUnknownError("Something odd happened"))
 

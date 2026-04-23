@@ -6,9 +6,10 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import event, func, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
+from sqlalchemy.pool import NullPool
 
 from cyberdrop_dl.utils.logger import log
 
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
 _FETCH_MANY_SIZE = 1000
 _BUNKR_FAILURE_FILE_SIZE = 322509
 _BUNKR_FAILURE_HASH = "eb669b6362e031fa2b0f1215480c4e30"
+_SQLITE_BUSY_TIMEOUT_MS = 60_000
 
 
 def _utcnow() -> datetime:
@@ -39,6 +41,7 @@ class Database:
         self.ignore_history = ignore_history
         self._engine: AsyncEngine
         self._sessionmaker: async_sessionmaker[AsyncSession]
+        self._write_lock = asyncio.Lock()
 
     async def startup(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -47,7 +50,13 @@ class Database:
 
         await asyncio.to_thread(self._run_migrations)
 
-        self._engine = create_async_engine(self._async_url, future=True)
+        self._engine = create_async_engine(
+            self._async_url,
+            future=True,
+            connect_args={"timeout": _SQLITE_BUSY_TIMEOUT_MS / 1000},
+            poolclass=NullPool,
+        )
+        self._configure_sqlite_connections()
         self._sessionmaker = async_sessionmaker(self._engine, expire_on_commit=False)
 
         if db_state.has_legacy_tables and await self._new_schema_is_empty():
@@ -70,12 +79,19 @@ class Database:
             if record is None:
                 return False
 
+            record_id = record.id
             completed = bool(record.completed)
-            referer_str = str(referer)
-            if completed and record.referer != referer_str:
-                record.referer = referer_str
-                await session.commit()
-            return completed
+            old_referer = record.referer
+
+        referer_str = str(referer)
+        if completed and old_referer != referer_str:
+            async with self._write_lock:
+                async with self._sessionmaker() as session:
+                    record = await session.get(MediaItemRecord, record_id)
+                    if record is not None:
+                        record.referer = referer_str
+                        await session.commit()
+        return completed
 
     async def check_complete_by_referer(self, domain: str | None, referer: URL | str) -> bool:
         if self.ignore_history:
@@ -106,24 +122,30 @@ class Database:
     async def get_media_item(self, key: MediaLookupKey, defaults: MediaDefaults) -> MediaItemRow:
         async with self._sessionmaker() as session:
             record = await self._find_media_item_record(session, key)
-            if record is None:
-                created_at = defaults.created_at or _utcnow()
-                record = MediaItemRecord(
-                    domain=key.domain,
-                    url_path=key.db_path,
-                    referer=key.referer,
-                    album_id=defaults.album_id,
-                    download_path=defaults.download_path,
-                    download_filename=defaults.download_filename,
-                    original_filename=key.original_filename or defaults.original_filename,
-                    file_size=defaults.file_size,
-                    duration=defaults.duration,
-                    completed=False,
-                    created_at=created_at,
-                )
-                session.add(record)
-                await session.commit()
-                await session.refresh(record)
+            if record is not None:
+                return self._map_media_item(record)
+
+        async with self._write_lock:
+            async with self._sessionmaker() as session:
+                record = await self._find_media_item_record(session, key)
+                if record is None:
+                    created_at = defaults.created_at or _utcnow()
+                    record = MediaItemRecord(
+                        domain=key.domain,
+                        url_path=key.db_path,
+                        referer=key.referer,
+                        album_id=defaults.album_id,
+                        download_path=defaults.download_path,
+                        download_filename=defaults.download_filename,
+                        original_filename=key.original_filename or defaults.original_filename,
+                        file_size=defaults.file_size,
+                        duration=defaults.duration,
+                        completed=False,
+                        created_at=created_at,
+                    )
+                    session.add(record)
+                    await session.commit()
+                    await session.refresh(record)
             return self._map_media_item(record)
 
     async def update_media_item(self, media_item: MediaItem) -> None:
@@ -146,57 +168,58 @@ class Database:
         )
         file_row, hashes = await self._build_media_file_update(media_item)
 
-        async with self._sessionmaker() as session:
-            record = await self._find_media_item_record(session, key)
-            now = _utcnow()
-            if record is None:
-                record = MediaItemRecord(
-                    domain=key.domain,
-                    url_path=key.db_path,
-                    referer=key.referer,
-                    album_id=defaults.album_id,
-                    download_path=defaults.download_path,
-                    download_filename=defaults.download_filename,
-                    original_filename=key.original_filename or defaults.original_filename,
-                    file_size=defaults.file_size,
-                    duration=defaults.duration,
-                    completed=False,
-                    created_at=now,
+        async with self._write_lock:
+            async with self._sessionmaker() as session:
+                record = await self._find_media_item_record(session, key)
+                now = _utcnow()
+                if record is None:
+                    record = MediaItemRecord(
+                        domain=key.domain,
+                        url_path=key.db_path,
+                        referer=key.referer,
+                        album_id=defaults.album_id,
+                        download_path=defaults.download_path,
+                        download_filename=defaults.download_filename,
+                        original_filename=key.original_filename or defaults.original_filename,
+                        file_size=defaults.file_size,
+                        duration=defaults.duration,
+                        completed=False,
+                        created_at=now,
+                    )
+                    session.add(record)
+                    await session.flush()
+
+                completed = bool(record.completed)
+                completed_at = record.completed_at
+                if media_item.db_completed is not None:
+                    completed = media_item.db_completed
+                    if completed:
+                        completed_at = completed_at or now
+                    else:
+                        completed_at = None
+
+                record.referer = key.referer
+                record.album_id = media_item.album_id
+                record.download_path = str(media_item.download_folder)
+                record.download_filename = media_item.download_filename or record.download_filename
+                record.original_filename = media_item.original_filename
+                record.file_size = (
+                    file_row.file_size
+                    if file_row and file_row.file_size is not None
+                    else media_item.filesize
+                    if media_item.filesize is not None
+                    else record.file_size
                 )
-                session.add(record)
+                record.duration = media_item.duration if media_item.duration is not None else record.duration
+                record.completed = completed
+                record.completed_at = completed_at
+                record.created_at = record.created_at or now
+
                 await session.flush()
-
-            completed = bool(record.completed)
-            completed_at = record.completed_at
-            if media_item.db_completed is not None:
-                completed = media_item.db_completed
-                if completed:
-                    completed_at = completed_at or now
-                else:
-                    completed_at = None
-
-            record.referer = key.referer
-            record.album_id = media_item.album_id
-            record.download_path = str(media_item.download_folder)
-            record.download_filename = media_item.download_filename or record.download_filename
-            record.original_filename = media_item.original_filename
-            record.file_size = (
-                file_row.file_size
-                if file_row and file_row.file_size is not None
-                else media_item.filesize
-                if media_item.filesize is not None
-                else record.file_size
-            )
-            record.duration = media_item.duration if media_item.duration is not None else record.duration
-            record.completed = completed
-            record.completed_at = completed_at
-            record.created_at = record.created_at or now
-
-            await session.flush()
-            if file_row is not None:
-                file_row.media_item_id = record.id
-                await self._upsert_file(session, file_row, list(hashes))
-            await session.commit()
+                if file_row is not None:
+                    file_row.media_item_id = record.id
+                    await self._upsert_file(session, file_row, list(hashes))
+                await session.commit()
 
     async def get_all_media_items(self, after: date, before: date) -> AsyncGenerator[list[RetryMediaRow]]:
         async for rows in self._yield_retry_rows(
@@ -240,9 +263,10 @@ class Database:
             return [self._map_file(record) for record in records]
 
     async def update_files(self, file: FileRow, hashes: list[HashRow] | None = None) -> None:
-        async with self._sessionmaker() as session:
-            await self._upsert_file(session, file, hashes or [])
-            await session.commit()
+        async with self._write_lock:
+            async with self._sessionmaker() as session:
+                await self._upsert_file(session, file, hashes or [])
+                await session.commit()
 
     async def update_previously_unsupported(self, crawlers: dict[str, Crawler]) -> None:
         domains_to_update = {
@@ -253,25 +277,26 @@ class Database:
         if not domains_to_update:
             return
 
-        async with self._sessionmaker() as session:
-            for domain, like_pattern in domains_to_update.items():
-                stmt = select(MediaItemRecord).where(
-                    MediaItemRecord.domain == "no_crawler",
-                    MediaItemRecord.referer.like(like_pattern),
-                )
-                for record in (await session.scalars(stmt)).all():
-                    duplicate_stmt = select(MediaItemRecord.id).where(
-                        MediaItemRecord.domain == domain,
-                        MediaItemRecord.url_path == record.url_path,
-                        MediaItemRecord.original_filename == record.original_filename,
-                        MediaItemRecord.id != record.id,
+        async with self._write_lock:
+            async with self._sessionmaker() as session:
+                for domain, like_pattern in domains_to_update.items():
+                    stmt = select(MediaItemRecord).where(
+                        MediaItemRecord.domain == "no_crawler",
+                        MediaItemRecord.referer.like(like_pattern),
                     )
-                    duplicate = await session.scalar(duplicate_stmt.limit(1))
-                    if duplicate is None:
-                        record.domain = domain
-                    else:
-                        await session.delete(record)
-            await session.commit()
+                    for record in (await session.scalars(stmt)).all():
+                        duplicate_stmt = select(MediaItemRecord.id).where(
+                            MediaItemRecord.domain == domain,
+                            MediaItemRecord.url_path == record.url_path,
+                            MediaItemRecord.original_filename == record.original_filename,
+                            MediaItemRecord.id != record.id,
+                        )
+                        duplicate = await session.scalar(duplicate_stmt.limit(1))
+                        if duplicate is None:
+                            record.domain = domain
+                        else:
+                            await session.delete(record)
+                await session.commit()
 
     async def check_complete_by_filename_size(self, domain: str, filename: str | None, file_size: int | None) -> bool:
         if self.ignore_history or not filename or file_size is None:
@@ -324,6 +349,17 @@ class Database:
         config.set_main_option("script_location", str(Path(__file__).with_name("migrations")))
         config.set_main_option("sqlalchemy.url", self._sync_url)
         command.upgrade(config, "head")
+
+    def _configure_sqlite_connections(self) -> None:
+        @event.listens_for(self._engine.sync_engine, "connect")
+        def _set_sqlite_pragmas(dbapi_connection: Any, _: Any) -> None:
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute("PRAGMA busy_timeout = 60000")
+                cursor.execute("PRAGMA journal_mode = WAL")
+                cursor.execute("PRAGMA foreign_keys = ON")
+            finally:
+                cursor.close()
 
     async def _find_media_item_record(self, session: AsyncSession, key: MediaLookupKey) -> MediaItemRecord | None:
         stmt = select(MediaItemRecord).where(
