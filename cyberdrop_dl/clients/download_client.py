@@ -41,6 +41,10 @@ _NULL_CONTEXT: contextlib.nullcontext[None] = contextlib.nullcontext()
 _USE_IMPERSONATION: set[str] = {"vsco", "celebforum", "coomer"}
 
 
+class _RetryWithoutRange(Exception):
+    """Signals a 416 on a resumed request — the stale .part has been deleted; retry from byte 0."""
+
+
 class DownloadClient:
     """AIOHTTP operations for downloading."""
 
@@ -107,21 +111,34 @@ class DownloadClient:
         else:
             media_item.partial_file = download_dir / f"{downloaded_filename}{constants.TempExt.PART}"
 
-        resume_point = 0
-        if (
-            self._supports_ranges
-            and media_item.partial_file
-            and (size := await asyncio.to_thread(get_size_or_none, media_item.partial_file))
-        ):
-            resume_point = size
-            download_headers["Range"] = f"bytes={size}-"
+        range_disabled = False
+        while True:
+            resume_point = 0
+            download_headers.pop("Range", None)
+            if (
+                not range_disabled
+                and self._supports_ranges
+                and media_item.partial_file
+                and (size := await asyncio.to_thread(get_size_or_none, media_item.partial_file))
+            ):
+                resume_point = size
+                download_headers["Range"] = f"bytes={size}-"
 
-        await asyncio.sleep(self.manager.config_manager.global_settings_data.rate_limiting_options.total_delay)
+            await asyncio.sleep(self.manager.config_manager.global_settings_data.rate_limiting_options.total_delay)
 
-        def process_response(resp: aiohttp.ClientResponse | AbstractResponse):
-            return self._process_response(media_item, domain, resume_point, resp)
+            def process_response(resp: aiohttp.ClientResponse | AbstractResponse):
+                return self._process_response(media_item, domain, resume_point, resp)
 
-        return await self._request_download(media_item, download_headers, process_response)
+            try:
+                return await self._request_download(media_item, download_headers, process_response)
+            except _RetryWithoutRange:
+                log(
+                    f"Download of {media_item.url} got 416 Range Not Satisfiable; "
+                    "the stale partial file was removed. Retrying from byte 0.",
+                    30,
+                )
+                range_disabled = True
+                continue
 
     async def _process_response(
         self,
@@ -131,7 +148,9 @@ class DownloadClient:
         resp: aiohttp.ClientResponse | AbstractResponse,
     ) -> bool:
         if resp.status == HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE:
-            await asyncio.to_thread(media_item.partial_file.unlink)
+            await asyncio.to_thread(media_item.partial_file.unlink, missing_ok=True)
+            if resume_point > 0:
+                raise _RetryWithoutRange
 
         await self.client_manager.check_http_status(resp, download=True)
 

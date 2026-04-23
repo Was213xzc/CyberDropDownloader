@@ -16,6 +16,9 @@ from cyberdrop_dl.config.config_model import CompressionOptions, ConfigSettings
 from cyberdrop_dl.managers.compression_manager import (
     CompressionManager,
     CompressionResult,
+    EffectiveVideoSettings,
+    VideoCodecCapabilities,
+    _PersistentWorkerDied,
     _format_pynv_exception,
 )
 from cyberdrop_dl.utils import yaml
@@ -89,6 +92,7 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert options.enabled is True
         assert options.compress_videos is True
         assert options.compress_images is True
+        assert options.video_profile == "hevc_balanced"
         assert options.video_backend == "pynv"
         assert options.ffmpeg_nvenc_fallback is False
         assert options.video_codec == "hevc"
@@ -102,12 +106,17 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert options.idrperiod == 60
         assert options.image_min_savings_percent == 0
 
-        assert CompressionOptions.model_validate({"video_workers_per_gpu": 99}).video_workers_per_gpu == 2
+        assert CompressionOptions.model_validate({"video_workers_per_gpu": 99}).video_workers_per_gpu == 99
         assert CompressionOptions.model_validate({"video_workers_per_gpu": 0}).video_workers_per_gpu == 1
+        assert CompressionOptions.model_validate({"video_profile": "AV1_SAVINGS"}).video_profile == "av1_savings"
         assert CompressionOptions.model_validate({"video_codec": "AV1"}).video_codec == "av1"
+        assert CompressionOptions().effective_video_profile() == "hevc_balanced"
+        assert CompressionOptions(video_profile="custom").effective_video_profile() == "custom"
+        assert CompressionOptions(preset="P4").effective_video_profile() == "custom"
 
         yaml.save(config_file, ConfigSettings())
         serialized_config = yaml.load(config_file)
+        assert serialized_config["compression_options"]["video_profile"] == "hevc_balanced"
         assert serialized_config["compression_options"]["video_codec"] == "hevc"
         assert serialized_config["compression_options"]["video_workers_per_gpu"] == 2
         assert serialized_config["compression_options"]["ffmpeg_nvenc_fallback"] is False
@@ -148,13 +157,16 @@ def test_pynv_retries_higher_cq_when_output_is_too_large() -> None:
         compression_manager = CompressionManager(cast("Any", owner))
         calls: list[int] = []
 
-        async def transcode_pynv(source: Path, output: Path, gpu_id: int, codec: str, cq: int) -> None:
-            calls.append(cq)
-            if cq == 23:
+        async def ensure_runtime() -> object:
+            return object()
+
+        async def transcode_pynv(source: Path, output: Path, gpu_id: int, settings: EffectiveVideoSettings) -> None:
+            calls.append(settings.cq)
+            if settings.cq == 23:
                 raise RuntimeError("PyNvVideoCodec output exceeded safe size limit")
             await asyncio.to_thread(output.write_bytes, b"y" * 50)
 
-        compression_manager._import_pynv = lambda: object()
+        compression_manager._ensure_video_runtime = ensure_runtime
         compression_manager._transcode_with_pynv_subprocess = transcode_pynv
 
         result = asyncio.run(compression_manager.compress_media_item(_media_item(video)))
@@ -164,7 +176,7 @@ def test_pynv_retries_higher_cq_when_output_is_too_large() -> None:
         assert result.backend == "pynv"
         assert result.cq == 27
         assert calls == [23, 27]
-        assert video.read_bytes() == b"y" * 50
+        assert Path(result.path).read_bytes() == b"y" * 50
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -211,24 +223,154 @@ Error Type : avformat_open_input(&ctx, szFilePath, NULL, NULL) returned error " 
 
 
 def test_pynv_encoder_kwargs_use_gpu_buffers_constqp_and_b_frames() -> None:
-    compression_manager = CompressionManager(cast("Any", FakeCompressionOwner()))
+    hevc_owner = FakeCompressionOwner()
+    compression_manager = CompressionManager(cast("Any", hevc_owner))
+    compression_manager._codec_capabilities = {
+        0: {
+            "hevc": VideoCodecCapabilities(
+                codec="hevc",
+                supported=True,
+                num_encoder_engines=2,
+                num_max_bframes=5,
+                support_lookahead=True,
+                support_temporal_aq=True,
+                support_10bit_encode=True,
+            ),
+            "av1": VideoCodecCapabilities(codec="av1", supported=False),
+        }
+    }
 
-    hevc_kwargs = compression_manager._pynv_transcode_kwargs("hevc", 23)
-    av1_kwargs = compression_manager._pynv_transcode_kwargs("av1", 26)
+    hevc_kwargs = compression_manager._pynv_transcode_kwargs(compression_manager._effective_video_settings(0))
+    av1_manager = CompressionManager(
+        cast("Any", FakeCompressionOwner(CompressionOptions(video_profile="av1_savings")))
+    )
+    av1_manager._codec_capabilities = {
+        0: {
+            "hevc": VideoCodecCapabilities(codec="hevc", supported=True, num_max_bframes=5),
+            "av1": VideoCodecCapabilities(
+                codec="av1",
+                supported=True,
+                num_encoder_engines=2,
+                num_max_bframes=7,
+                support_lookahead=True,
+                support_temporal_aq=True,
+                support_10bit_encode=True,
+            ),
+        }
+    }
+    av1_kwargs = av1_manager._pynv_transcode_kwargs(av1_manager._effective_video_settings(0))
 
     assert hevc_kwargs["codec"] == "hevc"
     assert hevc_kwargs["constqp"] == 23
     assert av1_kwargs["codec"] == "av1"
     assert av1_kwargs["constqp"] == 26
     assert hevc_kwargs["bf"] == 3
-    assert hevc_kwargs["gop"] == 60
-    assert hevc_kwargs["idrperiod"] == 60
+    assert hevc_kwargs["gop"] == 120
+    assert hevc_kwargs["idrperiod"] == 120
     assert hevc_kwargs["usedevicememory"] is True
     assert hevc_kwargs["usecpuinputbuffer"] is False
     assert hevc_kwargs["format"] == "NV12"
-    assert hevc_kwargs["preset"] == "P6"
+    assert hevc_kwargs["preset"] == "P4"
     assert hevc_kwargs["tuning_info"] == "high_quality"
+    assert hevc_kwargs["aq"] == 1
+    assert "temporalaq" not in hevc_kwargs
+    assert hevc_kwargs["lookahead"] == 10
+    assert av1_kwargs["bf"] == 5
+    assert av1_kwargs["gop"] == 240
+    assert av1_kwargs["idrperiod"] == 240
+    assert av1_kwargs["preset"] == "P5"
+    assert av1_kwargs["aq"] == 1
+    assert av1_kwargs["temporalaq"] == 1
+    assert av1_kwargs["lookahead"] == 16
     assert "gpu_id" not in hevc_kwargs
+
+
+def test_video_profile_selection_gates_features_from_encoder_caps() -> None:
+    owner = FakeCompressionOwner(CompressionOptions(video_profile="hevc_balanced"))
+    compression_manager = CompressionManager(cast("Any", owner))
+    compression_manager._codec_capabilities = {
+        0: {
+            "hevc": VideoCodecCapabilities(
+                codec="hevc",
+                supported=True,
+                num_encoder_engines=2,
+                num_max_bframes=2,
+                support_lookahead=False,
+                support_temporal_aq=True,
+                support_10bit_encode=True,
+            ),
+            "av1": VideoCodecCapabilities(codec="av1", supported=False),
+        }
+    }
+
+    settings = compression_manager._effective_video_settings(0)
+
+    assert settings.profile == "hevc_balanced"
+    assert settings.codec == "hevc"
+    assert settings.cq == 23
+    assert settings.bf == 2
+    assert settings.gop == 120
+    assert settings.idrperiod == 120
+    assert settings.preset == "P4"
+    assert settings.aq is True
+    assert settings.temporalaq is False
+    assert settings.lookahead == 0
+    assert settings.support_10bit_encode is True
+
+
+def test_av1_profile_downgrades_to_hevc_when_gpu_lacks_av1_encode() -> None:
+    owner = FakeCompressionOwner(CompressionOptions(video_profile="av1_savings"))
+    compression_manager = CompressionManager(cast("Any", owner))
+    compression_manager._codec_capabilities = {
+        0: {
+            "hevc": VideoCodecCapabilities(codec="hevc", supported=True, num_max_bframes=4),
+            "av1": VideoCodecCapabilities(codec="av1", supported=False),
+        }
+    }
+
+    settings = compression_manager._effective_video_settings(0)
+
+    assert settings.requested_profile == "av1_savings"
+    assert settings.profile == "hevc_balanced"
+    assert settings.downgraded_from == "av1_savings"
+    assert settings.codec == "hevc"
+    assert settings.codec_supported is True
+
+
+def test_custom_profile_preserves_advanced_nvidia_settings() -> None:
+    owner = FakeCompressionOwner(
+        CompressionOptions(
+            video_profile="custom",
+            video_codec="av1",
+            av1_cq=29,
+            bf=7,
+            gop=48,
+            idrperiod=96,
+            preset="P4",
+            tuning_info="ultra_low_latency",
+        )
+    )
+    compression_manager = CompressionManager(cast("Any", owner))
+    compression_manager._codec_capabilities = {
+        0: {
+            "hevc": VideoCodecCapabilities(codec="hevc", supported=True),
+            "av1": VideoCodecCapabilities(codec="av1", supported=True, num_max_bframes=3),
+        }
+    }
+
+    settings = compression_manager._effective_video_settings(0)
+
+    assert settings.profile == "custom"
+    assert settings.codec == "av1"
+    assert settings.cq == 29
+    assert settings.bf == 7
+    assert settings.gop == 48
+    assert settings.idrperiod == 96
+    assert settings.preset == "P4"
+    assert settings.tuning_info == "ultra_low_latency"
+    assert settings.aq is False
+    assert settings.temporalaq is False
+    assert settings.lookahead == 0
 
 
 def test_pynv_worker_stringifies_config_and_resolves_segment_output() -> None:
@@ -679,6 +821,120 @@ def test_video_slots_allow_at_most_two_jobs_per_gpu() -> None:
     asyncio.run(run_all_jobs())
 
     assert peak_by_gpu == {0: 2, 1: 2}
+
+
+def test_video_runtime_startup_uses_encoder_engine_count_for_worker_slots() -> None:
+    owner = FakeCompressionOwner(CompressionOptions(gpu_ids=[0, 1], video_workers_per_gpu=4))
+    compression_manager = CompressionManager(cast("Any", owner))
+    started: list[tuple[int, int]] = []
+    closed: list[int] = []
+
+    class FakeWorker:
+        def __init__(self, gpu_id: int, max_jobs: int) -> None:
+            self.gpu_id = gpu_id
+            self.max_jobs = max_jobs
+            self.alive = False
+
+        async def start(self) -> None:
+            self.alive = True
+            started.append((self.gpu_id, self.max_jobs))
+
+        async def close(self) -> None:
+            self.alive = False
+            closed.append(self.gpu_id)
+
+    def fake_probe(pynv: Any) -> dict[int, dict[str, VideoCodecCapabilities]]:
+        return {
+            0: {
+                "hevc": VideoCodecCapabilities(codec="hevc", supported=True, num_encoder_engines=2),
+                "av1": VideoCodecCapabilities(codec="av1", supported=True, num_encoder_engines=2),
+            },
+            1: {
+                "hevc": VideoCodecCapabilities(codec="hevc", supported=True, num_encoder_engines=1),
+                "av1": VideoCodecCapabilities(codec="av1", supported=False, num_encoder_engines=1),
+            },
+        }
+
+    compression_manager._import_pynv = lambda: object()
+    compression_manager._probe_encoder_capabilities = fake_probe
+    compression_manager._create_persistent_worker = lambda gpu_id, max_jobs: cast(
+        "Any",
+        FakeWorker(gpu_id, max_jobs),
+    )
+
+    async def run() -> None:
+        compression_manager.startup()
+        await asyncio.wait_for(cast("Any", compression_manager._video_runtime_task), timeout=1)
+        assert compression_manager._gpu_dispatch_order == [0, 0, 1]
+        assert compression_manager._worker_slots_for_gpu(0) == 2
+        assert compression_manager._worker_slots_for_gpu(1) == 1
+        await compression_manager.close()
+
+    asyncio.run(run())
+
+    assert started == [(0, 2), (1, 1)]
+    assert sorted(closed) == [0, 1]
+
+
+def test_persistent_worker_restart_retries_transcode_once() -> None:
+    root = _reset_test_dir()
+    try:
+        owner = FakeCompressionOwner()
+        compression_manager = CompressionManager(cast("Any", owner))
+        source = root / "input.mp4"
+        output = root / "output.mp4"
+        source.write_bytes(b"source")
+        calls: list[str] = []
+
+        class FakeWorker:
+            def __init__(self, name: str, *, fail: bool = False) -> None:
+                self.name = name
+                self.fail = fail
+                self.max_jobs = 1
+                self.alive = True
+
+            async def start(self) -> None:
+                self.alive = True
+
+            async def close(self) -> None:
+                self.alive = False
+                calls.append(f"close:{self.name}")
+
+            async def transcode(self, source: Path, temp_output: Path, config: dict[str, Any]) -> None:
+                calls.append(f"transcode:{self.name}:{config['codec']}:{config['constqp']}")
+                if self.fail:
+                    self.fail = False
+                    self.alive = False
+                    raise _PersistentWorkerDied("worker crashed")
+                await asyncio.to_thread(temp_output.write_bytes, b"compressed")
+
+        replacement = FakeWorker("replacement")
+        compression_manager._pynv_workers = {0: FakeWorker("primary", fail=True)}
+        compression_manager._ensure_video_runtime = lambda: asyncio.sleep(0, result=object())
+        compression_manager._create_persistent_worker = lambda gpu_id, max_jobs: cast("Any", replacement)
+
+        settings = EffectiveVideoSettings(
+            profile="hevc_balanced",
+            requested_profile="hevc_balanced",
+            codec="hevc",
+            cq=23,
+            bf=3,
+            gop=120,
+            idrperiod=120,
+            preset="P5",
+            tuning_info="high_quality",
+        )
+
+        asyncio.run(compression_manager._transcode_with_pynv_subprocess(source, output, 0, settings))
+
+        assert output.read_bytes() == b"compressed"
+        assert calls == [
+            "transcode:primary:hevc:23",
+            "close:primary",
+            "transcode:replacement:hevc:23",
+        ]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_resolve_pynv_timestamped_segment_output() -> None:

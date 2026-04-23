@@ -3,6 +3,7 @@ import re
 from datetime import date, datetime, timedelta
 from logging import DEBUG
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ByteSize, NonNegativeInt, PositiveInt, field_serializer, field_validator
 
@@ -286,15 +287,19 @@ class DupeCleanup(BaseModel):
     send_deleted_to_trash: bool = True
 
 
+CompressionVideoProfile = Literal["hevc_balanced", "av1_savings", "custom"]
+
+
 class CompressionOptions(BaseModel):
     enabled: bool = True
     compress_videos: bool = True
     compress_images: bool = True
+    video_profile: NonEmptyStr = "hevc_balanced"
     video_backend: NonEmptyStr = "pynv"
     ffmpeg_nvenc_fallback: bool = False
     video_codec: NonEmptyStr = "hevc"
     gpu_ids: list[NonNegativeInt] = [0]
-    video_workers_per_gpu: PositiveInt = Field(2, le=2)
+    video_workers_per_gpu: PositiveInt = 2
     hevc_cq: NonNegativeInt = 23
     av1_cq: NonNegativeInt = 26
     video_cq_retry_step: PositiveInt = 4
@@ -317,6 +322,14 @@ class CompressionOptions(BaseModel):
             raise ValueError("only 'pynv' is supported")
         return value.casefold()
 
+    @field_validator("video_profile", mode="after")
+    @classmethod
+    def validate_video_profile(cls, value: str) -> str:
+        profile = value.casefold()
+        if profile not in {"hevc_balanced", "av1_savings", "custom"}:
+            raise ValueError("video_profile must be 'hevc_balanced', 'av1_savings', or 'custom'")
+        return profile
+
     @field_validator("video_codec", mode="after")
     @classmethod
     def validate_video_codec(cls, value: str) -> str:
@@ -328,7 +341,29 @@ class CompressionOptions(BaseModel):
     @field_validator("video_workers_per_gpu", mode="before")
     @classmethod
     def clamp_video_workers_per_gpu(cls, value: int | str) -> int:
-        return min(max(int(value), 1), 2)
+        return max(int(value), 1)
+
+    def effective_video_profile(self) -> CompressionVideoProfile:
+        if self.video_profile != "hevc_balanced":
+            return self.video_profile
+
+        defaults = type(self)()
+        legacy_custom_fields = (
+            "video_codec",
+            "video_workers_per_gpu",
+            "hevc_cq",
+            "av1_cq",
+            "video_cq_retry_step",
+            "video_cq_max",
+            "bf",
+            "gop",
+            "idrperiod",
+            "preset",
+            "tuning_info",
+        )
+        if any(getattr(self, field) != getattr(defaults, field) for field in legacy_custom_fields):
+            return "custom"
+        return "hevc_balanced"
 
 
 class ConfigSettings(ConfigModel):

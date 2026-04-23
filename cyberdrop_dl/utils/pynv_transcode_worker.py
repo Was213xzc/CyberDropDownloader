@@ -39,17 +39,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     import PyNvVideoCodec
 
+    try:
+        _transcode_file(PyNvVideoCodec, source, output, int(gpu_id), config)
+    except Exception as e:
+        sys.stderr.write(f"{e}\n")
+        return 1
+
+    return 0
+
+
+def _transcode_file(pynv_module, source: str, output: str, gpu_id: int, config: dict[str, str]) -> Path:
     _delete_outputs(output)
     transcoder = None
     try:
-        transcoder = PyNvVideoCodec.Transcoder(source, output, int(gpu_id), 0, 0, **config)
+        transcoder = pynv_module.Transcoder(source, output, gpu_id, 0, 0, **config)
         if not hasattr(transcoder, "transcode_with_mux"):
             raise RuntimeError("PyNvVideoCodec transcoder does not expose transcode_with_mux")
         transcoder.transcode_with_mux()
     except Exception as e:
         _delete_outputs(output)
-        sys.stderr.write(f"{_format_exception(e, 'input')}\n")
-        return 1
+        raise RuntimeError(_format_exception(e, "input")) from e
     finally:
         del transcoder
         gc.collect()
@@ -59,13 +68,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         actual_output = _optimize_mp4_for_streaming(actual_output)
         _repair_sample_entry_for_target_codec(actual_output, str(config.get("codec", "")))
         _retag_hevc_sample_entries(actual_output)
-        _validate_output(PyNvVideoCodec, str(actual_output), int(gpu_id))
+        _validate_output(pynv_module, str(actual_output), gpu_id)
+        return actual_output
     except Exception as e:
         _delete_outputs(output)
-        sys.stderr.write(f"{_format_exception(e, 'output')}\n")
-        return 1
-
-    return 0
+        raise RuntimeError(_format_exception(e, "output")) from e
 
 
 def _stringify_config(config: dict) -> dict[str, str]:
