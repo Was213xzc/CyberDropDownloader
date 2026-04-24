@@ -153,6 +153,12 @@ class Downloader:
         self.manager.progress_manager.download_progress.update_queued(queued_files)
         self.manager.progress_manager.download_progress.update_total(increase_total)
 
+    def _get_file_lock_key(self, media_item: MediaItem) -> str:
+        """Lock concrete destination paths, not bare filenames shared across albums."""
+        if media_item.complete_file:
+            return str(media_item.complete_file)
+        return str(self.client.get_download_dir(media_item) / media_item.filename)
+
     @contextlib.asynccontextmanager
     async def _download_context(self, media_item: MediaItem):
         await self.manager.states.RUNNING.wait()
@@ -200,7 +206,7 @@ class Downloader:
             raise DownloadError("FFmpeg Error", msg, media_item) from None
 
         async with self._download_context(media_item):
-            lock = self._file_lock_vault[media_item.filename]
+            lock = self._file_lock_vault[self._get_file_lock_key(media_item)]
             await lock.acquire()
             release_lock = True
             try:
@@ -444,7 +450,7 @@ class Downloader:
         if not media_item.is_segment:
             log(f"{self.log_prefix} starting: {media_item.url}", 20)
 
-        lock = self._file_lock_vault[media_item.filename]
+        lock = self._file_lock_vault[self._get_file_lock_key(media_item)]
         await lock.acquire()
         release_lock = True
         try:

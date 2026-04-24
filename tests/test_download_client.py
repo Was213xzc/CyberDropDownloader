@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -6,6 +7,7 @@ from cyberdrop_dl.clients import download_client
 from cyberdrop_dl.crawlers.coomer import _coomer_download_fallbacks
 from cyberdrop_dl.data_structures import MediaItem
 from cyberdrop_dl.data_structures.url_objects import AbsoluteHttpURL
+from cyberdrop_dl.downloader.downloader import Downloader
 
 
 def _item(fallbacks_: object) -> MediaItem:
@@ -87,3 +89,28 @@ def test_coomer_download_fallbacks_rotate_from_cdn_to_origin_and_others() -> Non
         AbsoluteHttpURL("https://n3.coomer.st/data/30/1e/file.jpg?f=name.jpg"),
         AbsoluteHttpURL("https://n4.coomer.st/data/30/1e/file.jpg?f=name.jpg"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_downloader_file_lock_key_uses_destination_path(running_manager) -> None:
+    downloader = Downloader(running_manager, "gofile")
+    downloader.startup()
+
+    def make_item(folder: str) -> MediaItem:
+        return MediaItem(
+            url=AbsoluteHttpURL("https://gofile.io/d/file.mp4"),
+            domain="gofile",
+            referer=AbsoluteHttpURL("https://gofile.io/d/album"),
+            download_folder=Path(folder),
+            filename="shared-name.mp4",
+            original_filename="shared-name.mp4",
+            ext=".mp4",
+            db_path=f"{folder}/shared-name.mp4",
+        )
+
+    first = make_item(r"D:\downloads\album-a")
+    second = make_item(r"D:\downloads\album-b")
+    same_path = make_item(r"D:\downloads\album-a")
+
+    assert downloader._get_file_lock_key(first) != downloader._get_file_lock_key(second)
+    assert downloader._get_file_lock_key(first) == downloader._get_file_lock_key(same_path)
