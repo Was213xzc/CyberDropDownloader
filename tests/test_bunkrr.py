@@ -11,6 +11,7 @@ from cyberdrop_dl.crawlers.bunkrr import (
     _album_page_url,
     _get_album_last_page,
     _get_download_button_details,
+    _make_album_parser,
 )
 from cyberdrop_dl.data_structures import AbsoluteHttpURL
 from cyberdrop_dl.data_structures.url_objects import ScrapeItem
@@ -55,6 +56,26 @@ def test_get_download_button_details_reads_reinforced_href() -> None:
     assert download_url == AbsoluteHttpURL("https://get.bunkrr.su/file/11234941")
 
 
+def test_get_download_button_details_falls_back_to_embedded_file_id() -> None:
+    soup = BeautifulSoup(
+        """
+        <script defer data-file-id="11234941" src="../js/lv.js"></script>
+        <div id="fileTracker" data-file-id="11234941"></div>
+        <a class="btn btn-main ic-download-01">Download</a>
+        """,
+        "html.parser",
+    )
+
+    file_id, download_url = _get_download_button_details(
+        soup,
+        _parse_with_base,
+        AbsoluteHttpURL("https://bunkr.cr"),
+    )
+
+    assert file_id == "11234941"
+    assert download_url is None
+
+
 def test_get_download_button_details_raises_scrape_error_without_href() -> None:
     soup = BeautifulSoup('<a class="btn btn-main ic-download-01">Download</a>', "html.parser")
 
@@ -64,6 +85,37 @@ def test_get_download_button_details_raises_scrape_error_without_href() -> None:
             _parse_with_base,
             AbsoluteHttpURL("https://bunkr.cr"),
         )
+
+
+def test_album_parser_accepts_lenient_js_album_objects() -> None:
+    soup = BeautifulSoup(
+        """
+        <script>
+        window.albumFiles = [
+            {
+                id: 1,
+                name: 'fallback-name.mp4',
+                original: 'A "quoted" title.mp4',
+                slug: 'fallback-name.mp4',
+                timestamp: '12:00:00 01/01/2024',
+                thumbnail: 'https://static.scdn.st/thumbs/fallback-name.png',
+            },
+        ];
+        </script>
+        """,
+        "html.parser",
+    )
+
+    files = list(_make_album_parser()(soup))
+
+    assert files == [
+        File(
+            name='A "quoted" title.mp4',
+            slug="fallback-name.mp4",
+            thumbnail="https://static.scdn.st/thumbs/fallback-name.png",
+            date="12:00:00 01/01/2024",
+        )
+    ]
 
 
 def test_album_page_url_normalizes_existing_page_query() -> None:

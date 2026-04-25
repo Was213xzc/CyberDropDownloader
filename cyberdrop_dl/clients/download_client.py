@@ -363,9 +363,11 @@ class DownloadClient:
             try:
                 await self._promote_partial_to_complete(media_item)
             except FileExistsError:
-                if await self._handle_existing_destination_collision(domain, media_item):
+                collision_resolution = await self._handle_existing_destination_collision(domain, media_item)
+                if collision_resolution == "previous":
                     return False
-                raise
+                if collision_resolution is None:
+                    raise
             if not media_item.is_segment:
                 proceed = await self.client_manager.check_file_duration(media_item)
                 if not proceed:
@@ -402,20 +404,41 @@ class DownloadClient:
             await self.process_completed(media_item, domain)
             await self.handle_media_item_completion(media_item, downloaded=False)
 
-    async def _handle_existing_destination_collision(self, domain: str, media_item: MediaItem) -> bool:
+    async def _handle_existing_destination_collision(self, domain: str, media_item: MediaItem) -> str | None:
         complete_size = await aio.get_size(media_item.complete_file)
         partial_size = await aio.get_size(media_item.partial_file)
         known_sizes = {size for size in (partial_size, media_item.filesize) if size is not None}
-        if complete_size is None or not known_sizes or complete_size not in known_sizes:
-            return False
+        if complete_size is not None and known_sizes and complete_size in known_sizes:
+            log(
+                f"Treating {media_item.complete_file.name} as previously downloaded because the final file already exists",
+                10,
+            )
+            await aio.unlink(media_item.partial_file, missing_ok=True)
+            await self._mark_previously_downloaded(domain, media_item)
+            return "previous"
 
-        log(
-            f"Treating {media_item.complete_file.name} as previously downloaded because the final file already exists",
-            10,
-        )
-        await aio.unlink(media_item.partial_file, missing_ok=True)
-        await self._mark_previously_downloaded(domain, media_item)
-        return True
+        original_complete_file = media_item.complete_file
+        original_partial_file = media_item.partial_file
+        for _ in range(10):
+            candidate_complete_file, candidate_partial_file = await self.iterate_filename(original_complete_file, media_item)
+            try:
+                await asyncio.to_thread(original_partial_file.rename, candidate_complete_file)
+            except FileExistsError:
+                original_complete_file = candidate_complete_file
+                continue
+
+            log(
+                f"Renaming completed download to {candidate_complete_file.name} because "
+                f"{media_item.complete_file.name} already exists",
+                30,
+            )
+            media_item.complete_file = candidate_complete_file
+            media_item.partial_file = candidate_partial_file
+            media_item.download_filename = candidate_complete_file.name
+            await self.manager.database.update_media_item(media_item)
+            return "renamed"
+
+        return None
 
     async def mark_incomplete(self, media_item: MediaItem, domain: str) -> None:
         """Marks the media item as incomplete in the database."""

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
-import json
+import json as stdlib_json
 import re
 from collections.abc import Generator
 from pathlib import Path
@@ -15,6 +15,7 @@ from cyberdrop_dl.crawlers.crawler import Crawler, RateLimit, SupportedPaths, au
 from cyberdrop_dl.data_structures.url_objects import AbsoluteHttpURL
 from cyberdrop_dl.exceptions import DDOSGuardError, ScrapeError
 from cyberdrop_dl.utils import aio, css, open_graph
+from cyberdrop_dl.utils import json as cdl_json
 from cyberdrop_dl.utils.utilities import error_handling_wrapper, parse_url, xor_decrypt
 
 if TYPE_CHECKING:
@@ -40,22 +41,24 @@ class Selector:
 VIDEO_AND_IMAGE_EXTS: set[str] = FILE_FORMATS["Images"] | FILE_FORMATS["Videos"]
 HOST_OPTIONS: set[str] = {"bunkr.site", "bunkr.cr", "bunkr.ph"}
 DEEP_SCRAPE_CDNS: set[str] = {"burger", "milkshake"}  # CDNs under maintanance, ignore them and try to get a cached URL
-FILE_KEYS = "id", "name", "original", "slug", "type", "extension", "size", "timestamp", "thumbnail", "cdnEndpoint"
 ALBUM_PAGE_CONCURRENCY = 5
 known_bad_hosts: set[str] = set()
+_SINGLE_QUOTED_LITERAL_RE = re.compile(r"'((?:\\.|[^'\\])*)'")
 
 
-def _make_album_parser(keys: tuple[str, ...]) -> Callable[[BeautifulSoup], Generator[File]]:
-    translation_map = {f" {key}: ": f'"{key}": ' for key in keys}
-    pattern = re.compile("|".join(sorted(translation_map.keys(), key=len, reverse=True)))
-
+def _make_album_parser() -> Callable[[BeautifulSoup], Generator[File]]:
     def fix_unicode(value: str) -> str:
         return value.encode("raw_unicode_escape").decode("unicode-escape")
 
-    def decode(text: str) -> Generator[File]:
-        content = pattern.sub(lambda m: translation_map[m.group(0)], text.replace("\\'", "'"))
+    def normalize_single_quoted_literals(text: str) -> str:
+        normalized = _SINGLE_QUOTED_LITERAL_RE.sub(
+            lambda m: stdlib_json.dumps(m.group(1).replace("\\'", "'")),
+            text,
+        )
+        return re.sub(r",(\s*[}\]])", r"\1", normalized)
 
-        for file in json.loads(content):
+    def decode(text: str) -> Generator[File]:
+        for file in cdl_json.load_js_obj(normalize_single_quoted_literals(text)):
             yield File(
                 name=fix_unicode(file.get("original") or file["name"]),
                 slug=fix_unicode(file["slug"]),
@@ -81,9 +84,14 @@ def _get_download_button_details(
         return file_id, None
 
     href = css.get_attr_or_none(button, "href")
-    if not href:
-        raise ScrapeError(422, "Bunkr download button is missing href")
-    return None, parse_url(href, relative_to)
+    if href:
+        return None, parse_url(href, relative_to)
+
+    for selector in ("script[data-file-id]", "#fileTracker[data-file-id]"):
+        if file_id := css.select_one_get_attr_or_none(soup, selector, "data-file-id"):
+            return file_id, None
+
+    raise ScrapeError(422, "Bunkr download button is missing href")
 
 
 def _album_page_url(url: AbsoluteHttpURL, page: int) -> AbsoluteHttpURL:
@@ -175,7 +183,7 @@ class BunkrrCrawler(Crawler):
     def __post_init__(self) -> None:
         self.switch_host_locks: aio.WeakAsyncLocks[str] = aio.WeakAsyncLocks()
         self.known_good_url: AbsoluteHttpURL | None = None
-        self._parse_album_files = _make_album_parser(FILE_KEYS)
+        self._parse_album_files = _make_album_parser()
 
     async def fetch(self, scrape_item: ScrapeItem) -> None:
         match scrape_item.url.parts[1:]:
