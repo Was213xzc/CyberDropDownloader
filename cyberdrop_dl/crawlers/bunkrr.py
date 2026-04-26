@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import dataclasses
 import json as stdlib_json
-import re
 from collections.abc import Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -43,22 +42,145 @@ HOST_OPTIONS: set[str] = {"bunkr.site", "bunkr.cr", "bunkr.ph"}
 DEEP_SCRAPE_CDNS: set[str] = {"burger", "milkshake"}  # CDNs under maintanance, ignore them and try to get a cached URL
 ALBUM_PAGE_CONCURRENCY = 5
 known_bad_hosts: set[str] = set()
-_SINGLE_QUOTED_LITERAL_RE = re.compile(r"'((?:\\.|[^'\\])*)'")
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_JS_IDENTIFIER_START_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$")
+_JS_IDENTIFIER_CHARS = _JS_IDENTIFIER_START_CHARS | frozenset("0123456789")
+_JS_SIMPLE_ESCAPES = {
+    "'": "'",
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "0": "\0",
+}
+
+
+def _decode_js_string_literal(text: str, start: int) -> tuple[str, int]:
+    quote = text[start]
+    chars: list[str] = []
+    index = start + 1
+
+    while index < len(text):
+        char = text[index]
+        if char == quote:
+            return "".join(chars), index + 1
+
+        if char != "\\":
+            chars.append(char)
+            index += 1
+            continue
+
+        index += 1
+        if index >= len(text):
+            chars.append("\\")
+            break
+
+        escape = text[index]
+        if escape in _JS_SIMPLE_ESCAPES:
+            chars.append(_JS_SIMPLE_ESCAPES[escape])
+            index += 1
+            continue
+
+        if escape == "x" and index + 2 < len(text):
+            value = text[index + 1 : index + 3]
+            if all(char in _HEX_DIGITS for char in value):
+                chars.append(chr(int(value, 16)))
+                index += 3
+                continue
+
+        if escape == "u":
+            if index + 1 < len(text) and text[index + 1] == "{":
+                end = text.find("}", index + 2)
+                value = text[index + 2 : end] if end != -1 else ""
+                if value and all(char in _HEX_DIGITS for char in value):
+                    chars.append(chr(int(value, 16)))
+                    index = end + 1
+                    continue
+
+            if index + 4 < len(text):
+                value = text[index + 1 : index + 5]
+                if all(char in _HEX_DIGITS for char in value):
+                    chars.append(chr(int(value, 16)))
+                    index += 5
+                    continue
+
+        # JavaScript permits line continuations and identity escapes that JSON does not.
+        if escape in "\n\r":
+            if escape == "\r" and index + 1 < len(text) and text[index + 1] == "\n":
+                index += 1
+            index += 1
+            continue
+
+        chars.append(escape)
+        index += 1
+
+    return "".join(chars), index
+
+
+def _normalize_js_album_files(text: str) -> str:
+    normalized: list[str] = []
+    index = 0
+    last_significant_char = ""
+
+    def append(chunk: str) -> None:
+        nonlocal last_significant_char
+        normalized.append(chunk)
+        stripped = chunk.rstrip()
+        if stripped:
+            last_significant_char = stripped[-1]
+
+    while index < len(text):
+        char = text[index]
+        if char in {"'", '"'}:
+            literal, index = _decode_js_string_literal(text, index)
+            append(stdlib_json.dumps(literal, ensure_ascii=False))
+            continue
+
+        if char == ",":
+            lookahead = index + 1
+            while lookahead < len(text) and text[lookahead].isspace():
+                lookahead += 1
+            if lookahead < len(text) and text[lookahead] in "}]":
+                index += 1
+                continue
+
+        if char in _JS_IDENTIFIER_START_CHARS:
+            end = index + 1
+            while end < len(text) and text[end] in _JS_IDENTIFIER_CHARS:
+                end += 1
+
+            token = text[index:end]
+            lookahead = end
+            while lookahead < len(text) and text[lookahead].isspace():
+                lookahead += 1
+
+            if last_significant_char in "{," and lookahead < len(text) and text[lookahead] == ":":
+                append(stdlib_json.dumps(token))
+                index = end
+                continue
+
+            if token == "undefined":
+                append("null")
+                index = end
+                continue
+
+        append(char)
+        index += 1
+
+    return "".join(normalized)
 
 
 def _make_album_parser() -> Callable[[BeautifulSoup], Generator[File]]:
     def fix_unicode(value: str) -> str:
         return value.encode("raw_unicode_escape").decode("unicode-escape")
 
-    def normalize_single_quoted_literals(text: str) -> str:
-        normalized = _SINGLE_QUOTED_LITERAL_RE.sub(
-            lambda m: stdlib_json.dumps(m.group(1).replace("\\'", "'")),
-            text,
-        )
-        return re.sub(r",(\s*[}\]])", r"\1", normalized)
-
     def decode(text: str) -> Generator[File]:
-        for file in cdl_json.load_js_obj(normalize_single_quoted_literals(text)):
+        for file in cdl_json.loads(_normalize_js_album_files(text)):
             yield File(
                 name=fix_unicode(file.get("original") or file["name"]),
                 slug=fix_unicode(file["slug"]),

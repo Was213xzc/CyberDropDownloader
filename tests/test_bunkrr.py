@@ -118,6 +118,37 @@ def test_album_parser_accepts_lenient_js_album_objects() -> None:
     ]
 
 
+def test_album_parser_accepts_js_escapes_in_double_quoted_literals() -> None:
+    soup = BeautifulSoup(
+        """
+        <script>
+        window.albumFiles = [
+            {
+                id: 1,
+                name: "fallback-name.mp4",
+                original: "Lilith didn\\'t need me.mp4",
+                slug: "fallback-name.mp4",
+                timestamp: "12:00:00 01/01/2024",
+                thumbnail: "https://static.scdn.st/thumbs/fallback-name.png",
+            },
+        ];
+        </script>
+        """,
+        "html.parser",
+    )
+
+    files = list(_make_album_parser()(soup))
+
+    assert files == [
+        File(
+            name="Lilith didn't need me.mp4",
+            slug="fallback-name.mp4",
+            thumbnail="https://static.scdn.st/thumbs/fallback-name.png",
+            date="12:00:00 01/01/2024",
+        )
+    ]
+
+
 def test_album_page_url_normalizes_existing_page_query() -> None:
     url = AbsoluteHttpURL("https://bunkr.cr/a/fQ6HHKtg?page=3")
 
