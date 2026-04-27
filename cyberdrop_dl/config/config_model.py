@@ -309,7 +309,7 @@ class CompressionOptions(BaseModel):
     ffmpeg_nvenc_fallback: bool = False
     video_codec: NonEmptyStr = "hevc"
     gpu_ids: list[NonNegativeInt] = [0]
-    video_workers_per_gpu: PositiveInt = 2
+    video_workers_per_gpu: PositiveInt = 4
     hevc_cq: NonNegativeInt = 23
     av1_cq: NonNegativeInt = 26
     video_cq_retry_step: PositiveInt = 4

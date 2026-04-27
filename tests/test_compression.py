@@ -100,7 +100,7 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert options.handbrake_hw_decode is True
         assert options.ffmpeg_nvenc_fallback is False
         assert options.video_codec == "hevc"
-        assert options.video_workers_per_gpu == 2
+        assert options.video_workers_per_gpu == 4
         assert options.hevc_cq == 23
         assert options.av1_cq == 26
         assert options.video_cq_retry_step == 4
@@ -127,7 +127,7 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert serialized_config["compression_options"]["handbrake_encoder"] == "nvenc_h265_10bit"
         assert serialized_config["compression_options"]["handbrake_quality"] == 24
         assert serialized_config["compression_options"]["video_codec"] == "hevc"
-        assert serialized_config["compression_options"]["video_workers_per_gpu"] == 2
+        assert serialized_config["compression_options"]["video_workers_per_gpu"] == 4
         assert serialized_config["compression_options"]["ffmpeg_nvenc_fallback"] is False
         assert serialized_config["compression_options"]["image_min_savings_percent"] == 0
         assert serialized_config["compression_options"]["video_cq_retry_step"] == 4
