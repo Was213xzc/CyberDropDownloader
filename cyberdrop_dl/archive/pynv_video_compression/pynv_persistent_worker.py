@@ -5,7 +5,7 @@ import sys
 import threading
 from pathlib import Path
 
-from cyberdrop_dl.utils.pynv_transcode_worker import _stringify_config, _transcode_file
+from cyberdrop_dl.archive.pynv_video_compression.pynv_transcode_worker import _stringify_config, _transcode_file
 
 
 def _write_message(lock: threading.Lock, payload: dict) -> None:

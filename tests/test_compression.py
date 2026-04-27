@@ -11,18 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from PIL import Image
 
-from cyberdrop_dl.clients.download_client import DownloadClient
-from cyberdrop_dl.config.config_model import CompressionOptions, ConfigSettings
-from cyberdrop_dl.managers.compression_manager import (
-    CompressionManager,
-    CompressionResult,
-    EffectiveVideoSettings,
-    VideoCodecCapabilities,
-    _PersistentWorkerDied,
-    _format_pynv_exception,
-)
-from cyberdrop_dl.utils import yaml
-from cyberdrop_dl.utils.pynv_transcode_worker import (
+from cyberdrop_dl.archive.pynv_video_compression.pynv_transcode_worker import (
     _build_hvcc_body,
     _candidate_outputs_for_cleanup,
     _extract_inline_hevc_param_sets,
@@ -33,9 +22,18 @@ from cyberdrop_dl.utils.pynv_transcode_worker import (
     _retag_hevc_sample_entries,
     _stringify_config,
 )
-from cyberdrop_dl.utils.pynv_transcode_worker import (
+from cyberdrop_dl.archive.pynv_video_compression.pynv_transcode_worker import (
     main as pynv_worker_main,
 )
+from cyberdrop_dl.clients.download_client import DownloadClient
+from cyberdrop_dl.config.config_model import CompressionOptions, ConfigSettings
+from cyberdrop_dl.managers.compression_manager import (
+    CompressionManager,
+    CompressionResult,
+    EffectiveVideoSettings,
+    _format_handbrake_exception,
+)
+from cyberdrop_dl.utils import yaml
 
 if TYPE_CHECKING:
     from cyberdrop_dl.data_structures.url_objects import MediaItem
@@ -93,7 +91,13 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert options.compress_videos is True
         assert options.compress_images is True
         assert options.video_profile == "hevc_balanced"
-        assert options.video_backend == "pynv"
+        assert options.video_backend == "handbrake"
+        assert options.handbrake_cli_path == r"C:\Program Files\HandBrake\HandBrakeCLI.exe"
+        assert options.handbrake_preset == "rtx_5070ti_h265_nvenc"
+        assert options.handbrake_encoder == "nvenc_h265_10bit"
+        assert options.handbrake_quality == 24
+        assert options.handbrake_encoder_preset == "slow"
+        assert options.handbrake_hw_decode is True
         assert options.ffmpeg_nvenc_fallback is False
         assert options.video_codec == "hevc"
         assert options.video_workers_per_gpu == 2
@@ -110,13 +114,18 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert CompressionOptions.model_validate({"video_workers_per_gpu": 0}).video_workers_per_gpu == 1
         assert CompressionOptions.model_validate({"video_profile": "AV1_SAVINGS"}).video_profile == "av1_savings"
         assert CompressionOptions.model_validate({"video_codec": "AV1"}).video_codec == "av1"
+        assert CompressionOptions.model_validate({"video_backend": "pynv"}).video_backend == "handbrake"
         assert CompressionOptions().effective_video_profile() == "hevc_balanced"
         assert CompressionOptions(video_profile="custom").effective_video_profile() == "custom"
-        assert CompressionOptions(preset="P4").effective_video_profile() == "custom"
+        assert CompressionOptions(handbrake_encoder="x265").effective_video_profile() == "custom"
 
         yaml.save(config_file, ConfigSettings())
         serialized_config = yaml.load(config_file)
         assert serialized_config["compression_options"]["video_profile"] == "hevc_balanced"
+        assert serialized_config["compression_options"]["video_backend"] == "handbrake"
+        assert serialized_config["compression_options"]["handbrake_preset"] == "rtx_5070ti_h265_nvenc"
+        assert serialized_config["compression_options"]["handbrake_encoder"] == "nvenc_h265_10bit"
+        assert serialized_config["compression_options"]["handbrake_quality"] == 24
         assert serialized_config["compression_options"]["video_codec"] == "hevc"
         assert serialized_config["compression_options"]["video_workers_per_gpu"] == 2
         assert serialized_config["compression_options"]["ffmpeg_nvenc_fallback"] is False
@@ -128,249 +137,168 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_video_compression_skips_when_pynv_is_unavailable() -> None:
+def test_video_compression_skips_when_handbrake_cli_is_unavailable() -> None:
     root = _reset_test_dir()
     try:
         video = root / "video.mp4"
-        video.write_bytes(b"not a real video, but PyNv is checked before probing")
-        owner = FakeCompressionOwner(CompressionOptions(ffmpeg_nvenc_fallback=False))
+        video.write_bytes(b"not a real video, but HandBrake is checked before encoding")
+        owner = FakeCompressionOwner(CompressionOptions(handbrake_cli_path=str(root / "missing-HandBrakeCLI.exe")))
         compression_manager = CompressionManager(cast("Any", owner))
-        compression_manager._import_pynv = lambda: None
+        compression_manager._find_handbrake_cli = lambda: None
 
         result = asyncio.run(compression_manager.compress_media_item(_media_item(video)))
 
         assert result is not None
         assert result.status == "skipped"
-        assert result.error == "PyNvVideoCodec is not installed"
+        assert "HandBrakeCLI was not found" in result.error
         assert owner.progress_manager.results == [("skipped", 0)]
         assert owner.log_manager.rows[0]["status"] == "skipped"
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_pynv_retries_higher_cq_when_output_is_too_large() -> None:
+def test_handbrake_retries_higher_quality_when_output_is_too_large() -> None:
     root = _reset_test_dir()
     try:
         video = root / "video.mp4"
         video.write_bytes(b"x" * 100)
-        owner = FakeCompressionOwner(CompressionOptions(ffmpeg_nvenc_fallback=False))
+        owner = FakeCompressionOwner(CompressionOptions(handbrake_quality=24))
         compression_manager = CompressionManager(cast("Any", owner))
         calls: list[int] = []
 
-        async def ensure_runtime() -> object:
-            return object()
-
-        async def transcode_pynv(source: Path, output: Path, gpu_id: int, settings: EffectiveVideoSettings) -> None:
+        async def transcode_handbrake(
+            source: Path,
+            output: Path,
+            handbrake_cli: Path,
+            settings: EffectiveVideoSettings,
+        ) -> None:
             calls.append(settings.cq)
-            if settings.cq == 23:
-                raise RuntimeError("PyNvVideoCodec output exceeded safe size limit")
+            if settings.cq == 24:
+                await asyncio.to_thread(output.write_bytes, b"y" * 98)
+                return
             await asyncio.to_thread(output.write_bytes, b"y" * 50)
 
-        compression_manager._ensure_video_runtime = ensure_runtime
-        compression_manager._transcode_with_pynv_subprocess = transcode_pynv
+        compression_manager._find_handbrake_cli = lambda: Path("HandBrakeCLI.exe")
+        compression_manager._transcode_with_handbrake = transcode_handbrake
 
         result = asyncio.run(compression_manager.compress_media_item(_media_item(video)))
 
         assert result is not None
         assert result.status == "compressed"
-        assert result.backend == "pynv"
-        assert result.cq == 27
-        assert calls == [23, 27]
+        assert result.backend == "handbrake"
+        assert result.cq == 28
+        assert calls == [24, 28]
         assert Path(result.path).read_bytes() == b"y" * 50
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_pynv_invalid_input_errors_are_concise_and_non_retryable() -> None:
-    traceback_output = """
-Traceback (most recent call last):
-  File "pynv_transcode_worker.py", line 44, in main
-    transcoder = PyNvVideoCodec.Transcoder(...)
-_PyNvVideoCodec.PyNvVCException: FFmpegDemuxer::CreateFormatContext :
-Error code : -1094995529
-Error Type : avformat_open_input(&ctx, szFilePath, NULL, NULL) returned error " Invalid data found when processing input"
-    """
+def test_handbrake_invalid_input_errors_are_concise_and_non_retryable() -> None:
     compression_manager = CompressionManager(cast("Any", FakeCompressionOwner()))
 
-    assert _format_pynv_exception(RuntimeError("Invalid data found when processing input")) == (
-        "PyNvVideoCodec could not open the input video. "
+    assert _format_handbrake_exception(RuntimeError("Invalid data found when processing input")) == (
+        "HandBrakeCLI could not open the input video. "
         "The file is unsupported, corrupted, incomplete, or not a real video container."
     )
-    assert _format_pynv_exception(RuntimeError("Invalid data found when processing input"), "output") == (
-        "PyNvVideoCodec created an invalid output video at this CQ"
-    )
+    assert compression_manager._should_retry_with_higher_cq(
+        "HandBrakeCLI could not open the input video",
+        24,
+    ) is False
+    assert compression_manager._should_retry_with_higher_cq("Compressed output was not small enough", 24)
+
     assert _format_exception(RuntimeError("Invalid data found when processing input")) == (
         "PyNvVideoCodec could not open the input video. "
         "The file is unsupported, corrupted, incomplete, or not a real video container."
     )
-    assert _format_exception(RuntimeError("Invalid data found when processing input"), "output") == (
-        "PyNvVideoCodec created an invalid output video at this CQ"
-    )
-    assert compression_manager._should_retry_with_higher_cq(traceback_output, 23) is False
-    assert compression_manager._should_retry_with_higher_cq(
-        "PyNvVideoCodec created an invalid output video at this CQ",
-        23,
-    )
 
-    timescale_output = "[mov,mp4,m4a,3gp,3g2,mj2 @ 000001C6C0394040] stream 0, timescale not set"
-    assert _format_pynv_exception(RuntimeError(timescale_output)) == (
-        "PyNvVideoCodec could not read this MP4 stream timing metadata"
-    )
-    assert _format_exception(RuntimeError(timescale_output)) == (
-        "PyNvVideoCodec could not read this MP4 stream timing metadata "
-        "(timescale not set). The original file was kept and compression was skipped."
+
+def test_handbrake_command_uses_rtx_5070ti_defaults() -> None:
+    compression_manager = CompressionManager(cast("Any", FakeCompressionOwner()))
+    source = Path("input.mp4")
+    output = Path("input.compressed.mp4")
+
+    command = compression_manager._handbrake_command(
+        Path(r"C:\Program Files\HandBrake\HandBrakeCLI.exe"),
+        source,
+        output,
+        compression_manager._effective_video_settings(0),
     )
 
-
-def test_pynv_encoder_kwargs_use_gpu_buffers_constqp_and_b_frames() -> None:
-    hevc_owner = FakeCompressionOwner()
-    compression_manager = CompressionManager(cast("Any", hevc_owner))
-    compression_manager._codec_capabilities = {
-        0: {
-            "hevc": VideoCodecCapabilities(
-                codec="hevc",
-                supported=True,
-                num_encoder_engines=2,
-                num_max_bframes=5,
-                support_lookahead=True,
-                support_temporal_aq=True,
-                support_10bit_encode=True,
-            ),
-            "av1": VideoCodecCapabilities(codec="av1", supported=False),
-        }
-    }
-
-    hevc_kwargs = compression_manager._pynv_transcode_kwargs(compression_manager._effective_video_settings(0))
-    av1_manager = CompressionManager(
-        cast("Any", FakeCompressionOwner(CompressionOptions(video_profile="av1_savings")))
-    )
-    av1_manager._codec_capabilities = {
-        0: {
-            "hevc": VideoCodecCapabilities(codec="hevc", supported=True, num_max_bframes=5),
-            "av1": VideoCodecCapabilities(
-                codec="av1",
-                supported=True,
-                num_encoder_engines=2,
-                num_max_bframes=7,
-                support_lookahead=True,
-                support_temporal_aq=True,
-                support_10bit_encode=True,
-            ),
-        }
-    }
-    av1_kwargs = av1_manager._pynv_transcode_kwargs(av1_manager._effective_video_settings(0))
-
-    assert hevc_kwargs["codec"] == "hevc"
-    assert hevc_kwargs["constqp"] == 23
-    assert av1_kwargs["codec"] == "av1"
-    assert av1_kwargs["constqp"] == 26
-    assert hevc_kwargs["bf"] == 3
-    assert hevc_kwargs["gop"] == 120
-    assert hevc_kwargs["idrperiod"] == 120
-    assert hevc_kwargs["usedevicememory"] is True
-    assert hevc_kwargs["usecpuinputbuffer"] is False
-    assert hevc_kwargs["format"] == "NV12"
-    assert hevc_kwargs["preset"] == "P4"
-    assert hevc_kwargs["tuning_info"] == "high_quality"
-    assert hevc_kwargs["aq"] == 1
-    assert "temporalaq" not in hevc_kwargs
-    assert hevc_kwargs["lookahead"] == 10
-    assert av1_kwargs["bf"] == 5
-    assert av1_kwargs["gop"] == 240
-    assert av1_kwargs["idrperiod"] == 240
-    assert av1_kwargs["preset"] == "P5"
-    assert av1_kwargs["aq"] == 1
-    assert av1_kwargs["temporalaq"] == 1
-    assert av1_kwargs["lookahead"] == 16
-    assert "gpu_id" not in hevc_kwargs
+    assert command[:5] == [
+        r"C:\Program Files\HandBrake\HandBrakeCLI.exe",
+        "--input",
+        str(source),
+        "--output",
+        str(output),
+    ]
+    assert command[command.index("--encoder") + 1] == "nvenc_h265_10bit"
+    assert command[command.index("--quality") + 1] == "24"
+    assert command[command.index("--encoder-preset") + 1] == "slow"
+    assert command[command.index("--enable-hw-decoding") + 1] == "nvdec"
+    assert "--optimize" in command
+    assert "--crop-mode" in command
+    assert "none" in command
+    assert "--all-audio" in command
+    assert command[command.index("--aencoder") + 1] == "copy"
 
 
-def test_video_profile_selection_gates_features_from_encoder_caps() -> None:
+def test_video_profile_selection_uses_handbrake_defaults() -> None:
     owner = FakeCompressionOwner(CompressionOptions(video_profile="hevc_balanced"))
     compression_manager = CompressionManager(cast("Any", owner))
-    compression_manager._codec_capabilities = {
-        0: {
-            "hevc": VideoCodecCapabilities(
-                codec="hevc",
-                supported=True,
-                num_encoder_engines=2,
-                num_max_bframes=2,
-                support_lookahead=False,
-                support_temporal_aq=True,
-                support_10bit_encode=True,
-            ),
-            "av1": VideoCodecCapabilities(codec="av1", supported=False),
-        }
-    }
 
     settings = compression_manager._effective_video_settings(0)
 
     assert settings.profile == "hevc_balanced"
     assert settings.codec == "hevc"
-    assert settings.cq == 23
-    assert settings.bf == 2
+    assert settings.cq == 24
+    assert settings.bf == 3
     assert settings.gop == 120
     assert settings.idrperiod == 120
-    assert settings.preset == "P4"
-    assert settings.aq is True
-    assert settings.temporalaq is False
-    assert settings.lookahead == 0
+    assert settings.preset == "slow"
+    assert settings.handbrake_encoder == "nvenc_h265_10bit"
+    assert settings.handbrake_preset == "rtx_5070ti_h265_nvenc"
+    assert settings.handbrake_hw_decode is True
     assert settings.support_10bit_encode is True
 
 
-def test_av1_profile_downgrades_to_hevc_when_gpu_lacks_av1_encode() -> None:
+def test_av1_profile_uses_handbrake_nvenc_av1_savings_profile() -> None:
     owner = FakeCompressionOwner(CompressionOptions(video_profile="av1_savings"))
     compression_manager = CompressionManager(cast("Any", owner))
-    compression_manager._codec_capabilities = {
-        0: {
-            "hevc": VideoCodecCapabilities(codec="hevc", supported=True, num_max_bframes=4),
-            "av1": VideoCodecCapabilities(codec="av1", supported=False),
-        }
-    }
 
     settings = compression_manager._effective_video_settings(0)
 
     assert settings.requested_profile == "av1_savings"
-    assert settings.profile == "hevc_balanced"
-    assert settings.downgraded_from == "av1_savings"
-    assert settings.codec == "hevc"
-    assert settings.codec_supported is True
+    assert settings.profile == "av1_savings"
+    assert settings.codec == "av1"
+    assert settings.cq == 26
+    assert settings.preset == "slow"
+    assert settings.handbrake_encoder == "nvenc_av1_10bit"
 
 
-def test_custom_profile_preserves_advanced_nvidia_settings() -> None:
+def test_custom_profile_preserves_handbrake_settings() -> None:
     owner = FakeCompressionOwner(
         CompressionOptions(
             video_profile="custom",
-            video_codec="av1",
-            av1_cq=29,
-            bf=7,
-            gop=48,
-            idrperiod=96,
-            preset="P4",
-            tuning_info="ultra_low_latency",
+            handbrake_encoder="x265_10bit",
+            handbrake_quality=19,
+            handbrake_encoder_preset="slow",
+            handbrake_hw_decode=False,
+            handbrake_all_audio=False,
+            handbrake_audio_encoder="av_aac",
         )
     )
     compression_manager = CompressionManager(cast("Any", owner))
-    compression_manager._codec_capabilities = {
-        0: {
-            "hevc": VideoCodecCapabilities(codec="hevc", supported=True),
-            "av1": VideoCodecCapabilities(codec="av1", supported=True, num_max_bframes=3),
-        }
-    }
 
     settings = compression_manager._effective_video_settings(0)
 
     assert settings.profile == "custom"
-    assert settings.codec == "av1"
-    assert settings.cq == 29
-    assert settings.bf == 7
-    assert settings.gop == 48
-    assert settings.idrperiod == 96
-    assert settings.preset == "P4"
-    assert settings.tuning_info == "ultra_low_latency"
-    assert settings.aq is False
-    assert settings.temporalaq is False
-    assert settings.lookahead == 0
+    assert settings.codec == "hevc"
+    assert settings.cq == 19
+    assert settings.preset == "slow"
+    assert settings.handbrake_encoder == "x265_10bit"
+    assert settings.handbrake_hw_decode is False
+    assert settings.handbrake_all_audio is False
+    assert settings.handbrake_audio_encoder == "av_aac"
 
 
 def test_pynv_worker_stringifies_config_and_resolves_segment_output() -> None:
@@ -619,7 +547,7 @@ def test_repair_sample_entry_converts_empty_avc1_to_hvc1_for_hevc_bitstream() ->
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_repair_sample_entry_skips_non_hevc_targets_and_real_avcC() -> None:
+def test_repair_sample_entry_skips_non_hevc_targets_and_real_avcc() -> None:
     root = _reset_test_dir()
     try:
         ftyp = _mp4_atom(b"ftyp", b"isom\x00\x00\x00\x00")
@@ -770,34 +698,18 @@ def test_compressed_marker_picks_counter_suffix_on_collision() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_pynv_transcode_uses_installed_transcoder_api_shape() -> None:
-    calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
-
-    class FakeTranscoder:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            calls.append(("init", args, kwargs))
-
-        def transcode_with_mux(self) -> None:
-            calls.append(("transcode_with_mux", (), {}))
-
-    fake_pynv = SimpleNamespace(Transcoder=FakeTranscoder)
+def test_handbrake_uses_mp4_output_for_non_handbrake_container() -> None:
     compression_manager = CompressionManager(cast("Any", FakeCompressionOwner()))
-    source = Path("input.mp4")
-    output = Path("output.mp4")
+    mp4_source = Path("input.mp4")
+    avi_source = Path("input.avi")
 
-    compression_manager._transcode_with_pynv(cast("Any", fake_pynv), source, output, 1, "hevc", 23)
+    mp4_temp = compression_manager._temp_output_template(mp4_source)
+    avi_temp = compression_manager._temp_output_template(avi_source)
 
-    assert calls[0][0] == "init"
-    assert calls[0][1] == ()
-    assert calls[0][2]["enc_file_path"] == str(source)
-    assert calls[0][2]["muxed_file_path"] == str(output)
-    assert calls[0][2]["gpu_id"] == 1
-    assert calls[0][2]["cuda_context"] == 0
-    assert calls[0][2]["cuda_stream"] == 0
-    assert calls[0][2]["codec"] == "hevc"
-    assert calls[0][2]["constqp"] == "23"
-    assert calls[0][2]["usedevicememory"] == "true"
-    assert calls[1] == ("transcode_with_mux", (), {})
+    assert mp4_temp == Path("input.compressed.mp4")
+    assert compression_manager._final_video_output_path(mp4_source, mp4_temp) == mp4_source
+    assert avi_temp == Path("input.compressed.mp4")
+    assert compression_manager._final_video_output_path(avi_source, avi_temp) == avi_temp
 
 
 def test_video_slots_allow_at_most_two_jobs_per_gpu() -> None:
@@ -823,132 +735,77 @@ def test_video_slots_allow_at_most_two_jobs_per_gpu() -> None:
     assert peak_by_gpu == {0: 2, 1: 2}
 
 
-def test_video_runtime_startup_uses_encoder_engine_count_for_worker_slots() -> None:
+def test_video_runtime_startup_checks_handbrake_cli() -> None:
     owner = FakeCompressionOwner(CompressionOptions(gpu_ids=[0, 1], video_workers_per_gpu=4))
     compression_manager = CompressionManager(cast("Any", owner))
-    started: list[tuple[int, int]] = []
-    closed: list[int] = []
-
-    class FakeWorker:
-        def __init__(self, gpu_id: int, max_jobs: int) -> None:
-            self.gpu_id = gpu_id
-            self.max_jobs = max_jobs
-            self.alive = False
-
-        async def start(self) -> None:
-            self.alive = True
-            started.append((self.gpu_id, self.max_jobs))
-
-        async def close(self) -> None:
-            self.alive = False
-            closed.append(self.gpu_id)
-
-    def fake_probe(pynv: Any) -> dict[int, dict[str, VideoCodecCapabilities]]:
-        return {
-            0: {
-                "hevc": VideoCodecCapabilities(codec="hevc", supported=True, num_encoder_engines=2),
-                "av1": VideoCodecCapabilities(codec="av1", supported=True, num_encoder_engines=2),
-            },
-            1: {
-                "hevc": VideoCodecCapabilities(codec="hevc", supported=True, num_encoder_engines=1),
-                "av1": VideoCodecCapabilities(codec="av1", supported=False, num_encoder_engines=1),
-            },
-        }
-
-    compression_manager._import_pynv = lambda: object()
-    compression_manager._probe_encoder_capabilities = fake_probe
-    compression_manager._create_persistent_worker = lambda gpu_id, max_jobs: cast(
-        "Any",
-        FakeWorker(gpu_id, max_jobs),
-    )
+    checks: list[str] = []
+    compression_manager._find_handbrake_cli = lambda: checks.append("find") or Path("HandBrakeCLI.exe")
 
     async def run() -> None:
         compression_manager.startup()
-        await asyncio.wait_for(cast("Any", compression_manager._video_runtime_task), timeout=1)
-        assert compression_manager._gpu_dispatch_order == [0, 0, 1]
-        assert compression_manager._worker_slots_for_gpu(0) == 2
-        assert compression_manager._worker_slots_for_gpu(1) == 1
+        assert checks == ["find"]
         await compression_manager.close()
 
     asyncio.run(run())
 
-    assert started == [(0, 2), (1, 1)]
-    assert sorted(closed) == [0, 1]
 
-
-def test_persistent_worker_restart_retries_transcode_once() -> None:
+def test_handbrake_transcodes_non_mp4_source_to_marked_mp4() -> None:
     root = _reset_test_dir()
     try:
         owner = FakeCompressionOwner()
         compression_manager = CompressionManager(cast("Any", owner))
-        source = root / "input.mp4"
-        output = root / "output.mp4"
-        source.write_bytes(b"source")
-        calls: list[str] = []
+        source = root / "input.avi"
+        source.write_bytes(b"x" * 100)
 
-        class FakeWorker:
-            def __init__(self, name: str, *, fail: bool = False) -> None:
-                self.name = name
-                self.fail = fail
-                self.max_jobs = 1
-                self.alive = True
+        async def transcode_handbrake(
+            source: Path,
+            output: Path,
+            handbrake_cli: Path,
+            settings: EffectiveVideoSettings,
+        ) -> None:
+            assert output.name == "input.compressed.mp4"
+            await asyncio.to_thread(output.write_bytes, b"compressed")
 
-            async def start(self) -> None:
-                self.alive = True
+        compression_manager._find_handbrake_cli = lambda: Path("HandBrakeCLI.exe")
+        compression_manager._transcode_with_handbrake = transcode_handbrake
 
-            async def close(self) -> None:
-                self.alive = False
-                calls.append(f"close:{self.name}")
+        result = asyncio.run(compression_manager.compress_media_item(_media_item(source)))
 
-            async def transcode(self, source: Path, temp_output: Path, config: dict[str, Any]) -> None:
-                calls.append(f"transcode:{self.name}:{config['codec']}:{config['constqp']}")
-                if self.fail:
-                    self.fail = False
-                    self.alive = False
-                    raise _PersistentWorkerDied("worker crashed")
-                await asyncio.to_thread(temp_output.write_bytes, b"compressed")
-
-        replacement = FakeWorker("replacement")
-        compression_manager._pynv_workers = {0: FakeWorker("primary", fail=True)}
-        compression_manager._ensure_video_runtime = lambda: asyncio.sleep(0, result=object())
-        compression_manager._create_persistent_worker = lambda gpu_id, max_jobs: cast("Any", replacement)
-
-        settings = EffectiveVideoSettings(
-            profile="hevc_balanced",
-            requested_profile="hevc_balanced",
-            codec="hevc",
-            cq=23,
-            bf=3,
-            gop=120,
-            idrperiod=120,
-            preset="P5",
-            tuning_info="high_quality",
-        )
-
-        asyncio.run(compression_manager._transcode_with_pynv_subprocess(source, output, 0, settings))
-
-        assert output.read_bytes() == b"compressed"
-        assert calls == [
-            "transcode:primary:hevc:23",
-            "close:primary",
-            "transcode:replacement:hevc:23",
-        ]
+        assert result is not None
+        assert result.status == "compressed"
+        assert result.path.name == "[COMPRESSED] input.compressed.mp4"
+        assert result.path.read_bytes() == b"compressed"
+        assert not source.exists()
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_resolve_pynv_timestamped_segment_output() -> None:
+def test_handbrake_keeps_mp4_extension_when_replacing_same_container() -> None:
     root = _reset_test_dir()
     try:
         source = root / "video.mp4"
-        expected_output = root / "video.compressed.mp4"
-        timestamped_output = root / "video.compressed_0.00_12.50.mp4"
-        source.write_bytes(b"source")
-        timestamped_output.write_bytes(b"compressed")
-
         compression_manager = CompressionManager(cast("Any", FakeCompressionOwner()))
+        source.write_bytes(b"x" * 100)
 
-        assert compression_manager._resolve_pynv_output(source, expected_output) == timestamped_output
+        async def transcode_handbrake(
+            source: Path,
+            output: Path,
+            handbrake_cli: Path,
+            settings: EffectiveVideoSettings,
+        ) -> None:
+            assert output.name == "video.compressed.mp4"
+            await asyncio.to_thread(output.write_bytes, b"compressed")
+
+        compression_manager._find_handbrake_cli = lambda: Path("HandBrakeCLI.exe")
+        compression_manager._transcode_with_handbrake = transcode_handbrake
+
+        result = asyncio.run(compression_manager.compress_media_item(_media_item(source)))
+
+        assert result is not None
+        assert result.status == "compressed"
+        assert result.path.name == "[COMPRESSED] video.mp4"
+        assert result.path.read_bytes() == b"compressed"
+        assert not (root / "video.compressed.mp4").exists()
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -1025,7 +882,7 @@ def test_image_threshold_accepts_any_smaller_file_while_video_keeps_minimum_savi
                 temp_output,
                 "video",
                 media_type="video",
-                backend="pynv",
+                backend="handbrake",
                 path=source,
             )
         )
@@ -1057,7 +914,7 @@ def test_compression_report_write_failure_does_not_fail_compression() -> None:
                 CompressionResult(
                     status="compressed",
                     media_type="video",
-                    backend="pynv",
+                    backend="handbrake",
                     path=video,
                     original_size=100,
                     final_size=50,

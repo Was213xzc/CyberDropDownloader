@@ -295,7 +295,17 @@ class CompressionOptions(BaseModel):
     compress_videos: bool = True
     compress_images: bool = True
     video_profile: NonEmptyStr = "hevc_balanced"
-    video_backend: NonEmptyStr = "pynv"
+    video_backend: NonEmptyStr = "handbrake"
+    handbrake_cli_path: NonEmptyStr = r"C:\Program Files\HandBrake\HandBrakeCLI.exe"
+    handbrake_preset: NonEmptyStr = "rtx_5070ti_h265_nvenc"
+    handbrake_encoder: NonEmptyStr = "nvenc_h265_10bit"
+    handbrake_quality: NonNegativeInt = 24
+    handbrake_encoder_preset: NonEmptyStr = "slow"
+    handbrake_hw_decode: bool = True
+    handbrake_all_audio: bool = True
+    handbrake_audio_encoder: NonEmptyStr = "copy"
+    handbrake_audio_copy_mask: NonEmptyStr = "aac,ac3,eac3,truehd,dts,dtshd,mp2,mp3,opus,vorbis,flac,alac"
+    handbrake_audio_fallback: NonEmptyStr = "av_aac"
     ffmpeg_nvenc_fallback: bool = False
     video_codec: NonEmptyStr = "hevc"
     gpu_ids: list[NonNegativeInt] = [0]
@@ -318,9 +328,12 @@ class CompressionOptions(BaseModel):
     @field_validator("video_backend", mode="after")
     @classmethod
     def validate_video_backend(cls, value: str) -> str:
-        if value.casefold() != "pynv":
-            raise ValueError("only 'pynv' is supported")
-        return value.casefold()
+        backend = value.casefold()
+        if backend in {"pynv", "nvpyenc", "nvenc"}:
+            return "handbrake"
+        if backend != "handbrake":
+            raise ValueError("only 'handbrake' is supported")
+        return backend
 
     @field_validator("video_profile", mode="after")
     @classmethod
@@ -337,6 +350,27 @@ class CompressionOptions(BaseModel):
         if codec not in {"hevc", "av1"}:
             raise ValueError("video_codec must be 'hevc' or 'av1'")
         return codec
+
+    @field_validator("handbrake_encoder", mode="after")
+    @classmethod
+    def validate_handbrake_encoder(cls, value: str) -> str:
+        encoder = value.casefold()
+        if encoder not in {
+            "nvenc_h264",
+            "nvenc_av1",
+            "nvenc_av1_10bit",
+            "nvenc_h265",
+            "nvenc_h265_10bit",
+            "svt_av1",
+            "svt_av1_10bit",
+            "x264",
+            "x264_10bit",
+            "x265",
+            "x265_10bit",
+            "x265_12bit",
+        }:
+            raise ValueError("handbrake_encoder is not a supported HandBrake video encoder")
+        return encoder
 
     @field_validator("video_workers_per_gpu", mode="before")
     @classmethod
@@ -360,6 +394,15 @@ class CompressionOptions(BaseModel):
             "idrperiod",
             "preset",
             "tuning_info",
+            "handbrake_preset",
+            "handbrake_encoder",
+            "handbrake_quality",
+            "handbrake_encoder_preset",
+            "handbrake_hw_decode",
+            "handbrake_all_audio",
+            "handbrake_audio_encoder",
+            "handbrake_audio_copy_mask",
+            "handbrake_audio_fallback",
         )
         if any(getattr(self, field) != getattr(defaults, field) for field in legacy_custom_fields):
             return "custom"

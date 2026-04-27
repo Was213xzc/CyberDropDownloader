@@ -3,20 +3,22 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import gc
+import importlib
 import json
-import shutil
 import subprocess
 import sys
+from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from cyberdrop_dl.constants import FILE_FORMATS
 from cyberdrop_dl.utils.logger import log
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
+    from types import ModuleType
 
     from cyberdrop_dl.config.config_model import CompressionOptions
     from cyberdrop_dl.data_structures.url_objects import MediaItem
@@ -69,6 +71,17 @@ class CompressionResult:
 
 
 @dataclass(slots=True, kw_only=True)
+class VideoCodecCapabilities:
+    codec: str
+    supported: bool = True
+    num_encoder_engines: int = 1
+    num_max_bframes: int = 0
+    support_lookahead: bool = False
+    support_temporal_aq: bool = False
+    support_10bit_encode: bool = False
+
+
+@dataclass(slots=True, kw_only=True)
 class EffectiveVideoSettings:
     profile: VideoProfile
     requested_profile: VideoProfile
@@ -79,13 +92,6 @@ class EffectiveVideoSettings:
     idrperiod: int
     preset: str
     tuning_info: str
-    handbrake_encoder: str = ""
-    handbrake_preset: str = ""
-    handbrake_hw_decode: bool = True
-    handbrake_all_audio: bool = True
-    handbrake_audio_encoder: str = "copy"
-    handbrake_audio_copy_mask: str = "aac,ac3,eac3,truehd,dts,dtshd,mp2,mp3,opus,vorbis,flac,alac"
-    handbrake_audio_fallback: str = "av_aac"
     aq: bool = False
     temporalaq: bool = False
     lookahead: int = 0
@@ -95,14 +101,206 @@ class EffectiveVideoSettings:
     downgraded_from: VideoProfile | None = None
 
 
+class _PersistentWorkerDied(RuntimeError):
+    pass
+
+
+class _PersistentPynvGpuWorker:
+    def __init__(self, gpu_id: int, max_jobs: int) -> None:
+        self.gpu_id = gpu_id
+        self.max_jobs = max(max_jobs, 1)
+        self._process: asyncio.subprocess.Process | None = None
+        self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self._write_lock = asyncio.Lock()
+        self._stdout_task: asyncio.Task[None] | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
+        self._watch_task: asyncio.Task[None] | None = None
+        self._stderr_lines: deque[str] = deque(maxlen=20)
+        self._job_counter = 0
+        self._closed = False
+
+    @property
+    def alive(self) -> bool:
+        return self._process is not None and self._process.returncode is None
+
+    async def start(self) -> None:
+        if self.alive:
+            return
+        if self._process is not None:
+            await self.close()
+
+        kwargs = {
+            "stdin": asyncio.subprocess.PIPE,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        self._closed = False
+        self._process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "cyberdrop_dl.archive.pynv_video_compression.pynv_persistent_worker",
+            str(self.gpu_id),
+            str(self.max_jobs),
+            **kwargs,
+        )
+        self._stdout_task = asyncio.create_task(
+            self._read_stdout(),
+            name=f"cyberdrop-pynv-worker-{self.gpu_id}-stdout",
+        )
+        self._stderr_task = asyncio.create_task(
+            self._read_stderr(),
+            name=f"cyberdrop-pynv-worker-{self.gpu_id}-stderr",
+        )
+        self._watch_task = asyncio.create_task(
+            self._watch_process(),
+            name=f"cyberdrop-pynv-worker-{self.gpu_id}-watch",
+        )
+
+    async def close(self) -> None:
+        self._closed = True
+        process = self._process
+        if process is None:
+            return
+
+        try:
+            if process.returncode is None and process.stdin is not None:
+                payload = json.dumps({"command": "shutdown"}, ensure_ascii=False) + "\n"
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                    async with self._write_lock:
+                        process.stdin.write(payload.encode("utf-8"))
+                        await process.stdin.drain()
+                with contextlib.suppress(OSError):
+                    process.stdin.close()
+            if process.returncode is None:
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        process.kill()
+                    with contextlib.suppress(ProcessLookupError, OSError, asyncio.TimeoutError):
+                        await asyncio.wait_for(process.wait(), timeout=5)
+        finally:
+            self._fail_pending(_PersistentWorkerDied("Persistent PyNv worker closed"))
+            tasks = [task for task in (self._stdout_task, self._stderr_task, self._watch_task) if task is not None]
+            for task in tasks:
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                if tasks:
+                    await asyncio.gather(*tasks)
+            self._process = None
+            self._stdout_task = None
+            self._stderr_task = None
+            self._watch_task = None
+
+    async def transcode(self, source: Path, temp_output: Path, config: dict[str, Any]) -> None:
+        await self.start()
+        process = self._process
+        if process is None or process.stdin is None:
+            raise _PersistentWorkerDied("Persistent PyNv worker is unavailable")
+        if process.returncode is not None:
+            raise _PersistentWorkerDied(self._worker_exit_error())
+
+        loop = asyncio.get_running_loop()
+        self._job_counter += 1
+        job_id = self._job_counter
+        future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._pending[job_id] = future
+
+        payload = json.dumps(
+            {
+                "command": "transcode",
+                "job_id": job_id,
+                "source": str(source),
+                "output": str(temp_output),
+                "config": config,
+            },
+            ensure_ascii=False,
+        ) + "\n"
+        try:
+            async with self._write_lock:
+                process.stdin.write(payload.encode("utf-8"))
+                await process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            self._pending.pop(job_id, None)
+            raise _PersistentWorkerDied("Persistent PyNv worker input pipe closed") from e
+
+        response = await future
+        if response.get("status") != "ok":
+            raise RuntimeError(str(response.get("error") or "Persistent PyNv worker failed"))
+
+    async def _read_stdout(self) -> None:
+        process = self._process
+        if process is None or process.stdout is None:
+            return
+
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                return
+            try:
+                message = json.loads(line.decode("utf-8", errors="replace"))
+            except ValueError:
+                self._stderr_lines.append(f"Invalid JSON from persistent worker: {line!r}")
+                continue
+
+            job_id = message.get("job_id")
+            if not isinstance(job_id, int):
+                continue
+            future = self._pending.pop(job_id, None)
+            if future is not None and not future.done():
+                future.set_result(message)
+
+    async def _read_stderr(self) -> None:
+        process = self._process
+        if process is None or process.stderr is None:
+            return
+
+        while True:
+            line = await process.stderr.readline()
+            if not line:
+                return
+            message = line.decode("utf-8", errors="replace").strip()
+            if message:
+                self._stderr_lines.append(message)
+
+    async def _watch_process(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        returncode = await process.wait()
+        if self._closed:
+            return
+        self._fail_pending(_PersistentWorkerDied(self._worker_exit_error(returncode)))
+
+    def _worker_exit_error(self, returncode: int | None = None) -> str:
+        code = self._process.returncode if returncode is None and self._process is not None else returncode or 1
+        output = "\n".join(self._stderr_lines).strip()
+        return _format_pynv_worker_failure(code, output)
+
+    def _fail_pending(self, error: Exception) -> None:
+        for future in self._pending.values():
+            if future.done():
+                continue
+            future.set_exception(error.__class__(str(error)))
+        self._pending.clear()
+
+
 class CompressionManager:
     def __init__(self, manager: Manager) -> None:
         self.manager = manager
         self._gpu_index = 0
-        self._handbrake_unavailable_logged = False
+        self._pynv_unavailable_logged = False
         self._queue: asyncio.Queue[CompressionQueueItem | None] = asyncio.Queue()
         self._queue_tasks: list[asyncio.Task[None]] = []
         self._video_semaphores: dict[int, asyncio.BoundedSemaphore] = {}
+        self._video_runtime_lock = asyncio.Lock()
+        self._video_runtime_task: asyncio.Task[None] | None = None
+        self._video_runtime_ready = False
+        self._pynv_workers: dict[int, _PersistentPynvGpuWorker] = {}
+        self._codec_capabilities: dict[int, dict[str, VideoCodecCapabilities]] = {}
         self._gpu_dispatch_order: list[int] = []
         self._logged_video_settings: set[tuple[int, VideoProfile, VideoProfile, str]] = set()
         self._pending_paths: set[str] = set()
@@ -458,7 +656,7 @@ class CompressionManager:
                 return
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=0.5)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 continue
 
     @staticmethod
@@ -475,24 +673,9 @@ class CompressionManager:
             options.compress_images and ext in FILE_FORMATS["Images"]
         )
 
-    def _temp_output_template(self, source_path: Path) -> Path:
-        suffix = source_path.suffix
-        if source_path.suffix.casefold() in FILE_FORMATS["Videos"]:
-            suffix = self._handbrake_output_suffix(source_path)
-        return source_path.with_name(f"{source_path.stem}.compressed{suffix}")
-
     @staticmethod
-    def _handbrake_output_suffix(source_path: Path) -> str:
-        suffix = source_path.suffix.casefold()
-        if suffix in {".mp4", ".m4v", ".mov", ".mkv", ".webm"}:
-            return source_path.suffix
-        return ".mp4"
-
-    @staticmethod
-    def _final_video_output_path(source: Path, temp_output: Path) -> Path:
-        if temp_output.suffix.casefold() == source.suffix.casefold():
-            return source
-        return temp_output
+    def _temp_output_template(source_path: Path) -> Path:
+        return source_path.with_name(f"{source_path.stem}.compressed{source_path.suffix}")
 
     def _current_compression_output_size(self, temp_output: Path) -> int:
         largest = 0
@@ -565,23 +748,35 @@ class CompressionManager:
 
     async def _compress_video(self, media_item: MediaItem, source: Path) -> CompressionResult:
         gpu_id = self._next_gpu_id()
-        handbrake_cli = self._find_handbrake_cli()
-        if handbrake_cli is None:
+        pynv = await self._ensure_video_runtime()
+        if pynv is None:
             return CompressionResult(
                 status="skipped",
                 media_type="video",
-                backend="handbrake",
+                backend="pynv",
                 path=source,
                 gpu_id=gpu_id,
-                error=f"HandBrakeCLI was not found at {self.options.handbrake_cli_path}",
+                error="PyNvVideoCodec is not installed",
             )
 
         settings = self._effective_video_settings(gpu_id)
         self._log_effective_video_settings(gpu_id, settings)
+        if not settings.codec_supported:
+            return CompressionResult(
+                status="skipped",
+                media_type="video",
+                backend="pynv",
+                path=source,
+                gpu_id=gpu_id,
+                codec=settings.codec,
+                cq=settings.cq,
+                bf=settings.bf,
+                error=settings.unsupported_reason or f"{settings.codec.upper()} encoding is not supported by this GPU",
+            )
 
         result_kwargs = {
             "media_type": "video",
-            "backend": "handbrake",
+            "backend": "pynv",
             "path": source,
             "gpu_id": gpu_id,
             "codec": settings.codec,
@@ -591,31 +786,25 @@ class CompressionManager:
 
         temp_output_template = self._temp_output_template(source)
         errors: list[str] = []
-        cq_attempts = self._video_cq_attempts(settings.codec, settings.cq)
+        cq_attempts = self._video_cq_attempts(settings.codec)
         for attempt_cq in cq_attempts:
             attempt_settings = replace(settings, cq=attempt_cq)
             attempt_kwargs = result_kwargs | {"cq": attempt_cq, "bf": attempt_settings.bf}
             temp_output = temp_output_template
-            final_output = self._final_video_output_path(source, temp_output)
             await self._delete_temp(temp_output)
             try:
                 async with self._video_slot(gpu_id):
-                    await self._transcode_with_handbrake(source, temp_output, handbrake_cli, attempt_settings)
+                    await self._transcode_with_pynv_subprocess(source, temp_output, gpu_id, attempt_settings)
             except Exception as e:
                 await self._delete_temp(temp_output)
-                error = _format_handbrake_exception(e)
+                error = _format_pynv_exception(e)
                 errors.append(f"CQ {attempt_cq}: {error}")
                 if self._should_retry_with_higher_cq(error, attempt_cq):
                     continue
                 return CompressionResult(status="skipped", error=error, **attempt_kwargs)
 
-            result = await self._finalize_output(
-                source,
-                temp_output,
-                "video",
-                destination=final_output,
-                **attempt_kwargs,
-            )
+            actual_output = await asyncio.to_thread(self._resolve_pynv_output, source, temp_output)
+            result = await self._finalize_output(source, actual_output, "video", **attempt_kwargs)
             if result.status == "compressed":
                 return result
             errors.append(f"CQ {attempt_cq}: {result.error}")
@@ -624,7 +813,7 @@ class CompressionManager:
 
         return CompressionResult(
             status="skipped",
-            error=_summarize_retry_errors("HandBrakeCLI could not create a small enough output", errors),
+            error=_summarize_retry_errors("PyNvVideoCodec could not create a small enough output", errors),
             **(result_kwargs | {"cq": cq_attempts[-1], "bf": settings.bf}),
         )
 
@@ -683,11 +872,8 @@ class CompressionManager:
         source: Path,
         temp_output: Path,
         output_type: MediaType,
-        *,
-        destination: Path | None = None,
         **result_kwargs,
     ) -> CompressionResult:
-        destination = destination or source
         original_size = await asyncio.to_thread(lambda: source.stat().st_size)
         final_size = await asyncio.to_thread(lambda: temp_output.stat().st_size)
         result_kwargs |= {"original_size": original_size, "final_size": final_size}
@@ -705,10 +891,7 @@ class CompressionManager:
             await self._delete_temp(temp_output)
             return CompressionResult(status="skipped", error="Compressed output was not small enough", **result_kwargs)
 
-        await self._replace_temp(temp_output, destination)
-        if destination != source:
-            await self._delete_source_after_transcode(source)
-        result_kwargs["path"] = destination
+        await self._replace_temp(temp_output, source)
         return CompressionResult(status="compressed", **result_kwargs)
 
     async def _validate_video(self, path: Path) -> None:
@@ -721,103 +904,114 @@ class CompressionManager:
         with Image.open(path) as image:
             image.verify()
 
-    def _find_handbrake_cli(self) -> Path | None:
-        configured = str(self.options.handbrake_cli_path).strip()
-        candidates: list[str | Path] = []
-        if configured:
-            candidates.append(Path(configured))
-            resolved_configured = shutil.which(configured)
-            if resolved_configured is not None:
-                candidates.append(Path(resolved_configured))
-        candidates.extend(
-            (
-                Path(r"C:\Program Files\HandBrake\HandBrakeCLI.exe"),
-                "HandBrakeCLI.exe",
-                "HandBrakeCLI",
-            )
-        )
-
-        for candidate in candidates:
-            path = Path(candidate) if not isinstance(candidate, Path) else candidate
-            if path.is_file():
-                return path
-            if not path.is_absolute():
-                resolved = shutil.which(str(path))
-                if resolved is not None:
-                    return Path(resolved)
-
-        if not self._handbrake_unavailable_logged:
-            log(f"HandBrakeCLI was not found at {self.options.handbrake_cli_path}; video compression will be skipped", 30)
-            self._handbrake_unavailable_logged = True
-        return None
-
-    async def _transcode_with_handbrake(
+    async def _transcode_with_pynv_subprocess(
         self,
         source: Path,
         temp_output: Path,
-        handbrake_cli: Path,
+        gpu_id: int,
         settings: EffectiveVideoSettings,
     ) -> None:
-        command = self._handbrake_command(handbrake_cli, source, temp_output, settings)
-        kwargs = {
-            "stdout": asyncio.subprocess.PIPE,
-            "stderr": asyncio.subprocess.PIPE,
-        }
-        if sys.platform == "win32":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        await self._ensure_video_runtime()
+        worker = self._pynv_workers.get(gpu_id)
+        if worker is None:
+            raise RuntimeError(f"Persistent PyNv worker is unavailable for GPU {gpu_id}")
+        try:
+            await worker.transcode(source, temp_output, self._pynv_transcode_kwargs(settings))
+        except _PersistentWorkerDied:
+            await self._restart_pynv_worker(gpu_id)
+            worker = self._pynv_workers.get(gpu_id)
+            if worker is None:
+                raise RuntimeError(f"Persistent PyNv worker restart failed for GPU {gpu_id}")
+            await worker.transcode(source, temp_output, self._pynv_transcode_kwargs(settings))
 
-        process = await asyncio.create_subprocess_exec(*command, **kwargs)
-        stdout, stderr = await process.communicate()
-        if process.returncode != 0:
-            output = _tail_process_output(stdout, stderr)
-            raise RuntimeError(_format_handbrake_failure(process.returncode or 1, output))
-
-    def _handbrake_command(
+    def _transcode_with_pynv(
         self,
-        handbrake_cli: Path,
+        pynv: ModuleType,
         source: Path,
         temp_output: Path,
-        settings: EffectiveVideoSettings,
-    ) -> list[str]:
-        command = [
-            str(handbrake_cli),
-            "--input",
-            str(source),
-            "--output",
-            str(temp_output),
-            "--encoder",
-            settings.handbrake_encoder or self.options.handbrake_encoder,
-            "--quality",
-            str(settings.cq),
-            "--encoder-preset",
-            settings.preset,
-            "--vfr",
-            "--crop-mode",
-            "none",
-            "--keep-metadata",
-            "--no-comb-detect",
-            "--no-deinterlace",
-            "--no-decomb",
-            "--no-detelecine",
-            "--no-hqdn3d",
-            "--no-nlmeans",
+        gpu_id: int,
+        settings: EffectiveVideoSettings | str,
+        cq: int | None = None,
+    ) -> None:
+        effective_settings = self._coerce_effective_video_settings(settings, cq)
+        transcode_kwargs = self._stringify_pynv_kwargs(self._pynv_transcode_kwargs(effective_settings))
+        factory = getattr(pynv, "Transcoder", None) or getattr(pynv, "CreateTranscoder", None)
+        if factory is None:
+            raise RuntimeError("PyNvVideoCodec Transcoder API is unavailable")
+
+        transcoder = None
+        try:
+            try:
+                transcoder = factory(
+                    enc_file_path=str(source),
+                    muxed_file_path=str(temp_output),
+                    gpu_id=gpu_id,
+                    cuda_context=0,
+                    cuda_stream=0,
+                    **transcode_kwargs,
+                )
+            except TypeError:
+                if getattr(pynv, "Transcoder", None) is not None:
+                    transcoder = factory(str(source), str(temp_output), gpu_id, 0, 0, **transcode_kwargs)
+                else:
+                    transcoder = factory(str(source), str(temp_output), gpu_id, 0, 0, transcode_kwargs)
+
+            if hasattr(transcoder, "transcode_with_mux"):
+                transcoder.transcode_with_mux()
+            elif hasattr(transcoder, "transcode"):
+                transcoder.transcode()
+            elif hasattr(transcoder, "segmented_transcode"):
+                raise RuntimeError("PyNvVideoCodec transcoder only exposes segmented_transcode")
+            else:
+                raise RuntimeError("PyNvVideoCodec transcoder does not expose a transcode method")
+        finally:
+            del transcoder
+            gc.collect()
+
+    def _pynv_transcode_kwargs(self, settings: EffectiveVideoSettings | str, cq: int | None = None) -> dict:
+        effective_settings = self._coerce_effective_video_settings(settings, cq)
+        kwargs = {
+            "codec": effective_settings.codec,
+            "format": "NV12",
+            "usedevicememory": True,
+            "usecpuinputbuffer": False,
+            "rc": "constqp",
+            "constqp": effective_settings.cq,
+            "bf": effective_settings.bf,
+            "gop": effective_settings.gop,
+            "idrperiod": effective_settings.idrperiod,
+            "preset": effective_settings.preset,
+            "tuning_info": effective_settings.tuning_info,
+        }
+        if effective_settings.aq:
+            kwargs["aq"] = 1
+        if effective_settings.temporalaq:
+            kwargs["temporalaq"] = 1
+        if effective_settings.lookahead > 0:
+            kwargs["lookahead"] = effective_settings.lookahead
+        return kwargs
+
+    def _stringify_pynv_kwargs(self, kwargs: dict) -> dict[str, str]:
+        return {key: str(value).lower() if isinstance(value, bool) else str(value) for key, value in kwargs.items()}
+
+    def _resolve_pynv_output(self, source: Path, temp_output: Path) -> Path:
+        if temp_output.is_file():
+            return temp_output
+
+        candidates = [
+            path
+            for path in temp_output.parent.glob(f"{temp_output.stem}*{temp_output.suffix}")
+            if path.is_file() and path != source
         ]
+        if not candidates:
+            return temp_output
+        return max(candidates, key=lambda path: path.stat().st_mtime)
 
-        if settings.handbrake_hw_decode:
-            command.extend(("--enable-hw-decoding", "nvdec"))
-        if temp_output.suffix.casefold() in {".mp4", ".m4v", ".mov"}:
-            command.append("--optimize")
-        if settings.handbrake_all_audio:
-            command.append("--all-audio")
-        if settings.handbrake_audio_encoder:
-            command.extend(("--aencoder", settings.handbrake_audio_encoder))
-        if settings.handbrake_audio_encoder == "copy":
-            command.extend(("--audio-copy-mask", settings.handbrake_audio_copy_mask))
-            command.extend(("--audio-fallback", settings.handbrake_audio_fallback))
-        return command
+    def _codec_cq(self, codec: str) -> int:
+        return self.options.av1_cq if codec == "av1" else self.options.hevc_cq
 
-    def _video_cq_attempts(self, _codec: str, base_cq: int | None = None) -> list[int]:
-        base_cq = int(self.options.handbrake_quality if base_cq is None else base_cq)
+    def _video_cq_attempts(self, codec: str) -> list[int]:
+        base_cq = self._codec_cq(codec)
         max_cq = max(base_cq, int(self.options.video_cq_max))
         step = max(1, int(self.options.video_cq_retry_step))
         attempts = list(range(base_cq, max_cq + 1, step))
@@ -878,6 +1072,15 @@ class CompressionManager:
             except OSError as e:
                 log(f"Unable to write compression report row for {result.path}: {e}", 30)
 
+    def _import_pynv(self) -> ModuleType | None:
+        try:
+            return importlib.import_module("PyNvVideoCodec")
+        except ImportError:
+            if not self._pynv_unavailable_logged:
+                log("PyNvVideoCodec is not installed; video compression will be skipped", 30)
+                self._pynv_unavailable_logged = True
+            return None
+
     def _next_gpu_id(self) -> int:
         gpu_ids = self._gpu_dispatch_order or self.options.gpu_ids or [0]
         gpu_id = gpu_ids[self._gpu_index % len(gpu_ids)]
@@ -885,7 +1088,7 @@ class CompressionManager:
         return gpu_id
 
     def _make_video_semaphore(self, gpu_id: int) -> asyncio.BoundedSemaphore:
-        return asyncio.BoundedSemaphore(max(int(self.options.video_workers_per_gpu), 1))
+        return asyncio.BoundedSemaphore(self._worker_slots_for_gpu(gpu_id))
 
     def _video_slot(self, gpu_id: int) -> asyncio.BoundedSemaphore:
         semaphore = self._video_semaphores.get(gpu_id)
@@ -897,58 +1100,246 @@ class CompressionManager:
     def _start_video_runtime_if_needed(self) -> None:
         if not self.options.enabled or not self.options.compress_videos:
             return
-        self._find_handbrake_cli()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        if self._video_runtime_ready:
+            return
+        if self._video_runtime_task is not None and not self._video_runtime_task.done():
+            return
+        self._video_runtime_task = loop.create_task(
+            self._ensure_video_runtime(),
+            name="cyberdrop-compression-video-runtime",
+        )
+        self._video_runtime_task.add_done_callback(self._handle_video_runtime_task_done)
+
+    def _handle_video_runtime_task_done(self, task: asyncio.Task[None]) -> None:
+        with contextlib.suppress(asyncio.CancelledError):
+            exception = task.exception()
+            if exception is not None:
+                log(f"Compression video runtime startup failed: {exception}", 30)
 
     async def _close_video_runtime(self) -> None:
+        task = self._video_runtime_task
+        self._video_runtime_task = None
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        workers = list(self._pynv_workers.values())
+        self._pynv_workers.clear()
+        for worker in workers:
+            with contextlib.suppress(Exception):
+                await worker.close()
+        self._video_runtime_ready = False
+        self._codec_capabilities.clear()
         self._gpu_dispatch_order.clear()
         self._video_semaphores.clear()
         self._logged_video_settings.clear()
 
+    async def _ensure_video_runtime(self) -> ModuleType | None:
+        if self._video_runtime_ready and self._pynv_workers:
+            return self._import_pynv()
+
+        async with self._video_runtime_lock:
+            if self._video_runtime_ready and self._pynv_workers:
+                return self._import_pynv()
+
+            pynv = self._import_pynv()
+            if pynv is None:
+                return None
+
+            capabilities = await asyncio.to_thread(self._probe_encoder_capabilities, pynv)
+            new_workers: dict[int, _PersistentPynvGpuWorker] = {}
+            configured_gpu_ids = self.options.gpu_ids or [0]
+            dispatch_order: list[int] = []
+            try:
+                for gpu_id in configured_gpu_ids:
+                    slots = self._worker_slots_for_gpu(gpu_id, capabilities.get(gpu_id))
+                    dispatch_order.extend([gpu_id] * slots)
+                    worker = self._pynv_workers.get(gpu_id)
+                    if worker is None or worker.max_jobs != slots or not worker.alive:
+                        if worker is not None:
+                            await worker.close()
+                        worker = self._create_persistent_worker(gpu_id, slots)
+                        await worker.start()
+                    new_workers[gpu_id] = worker
+                    self._video_semaphores[gpu_id] = asyncio.BoundedSemaphore(slots)
+
+                for stale_gpu_id, worker in list(self._pynv_workers.items()):
+                    if stale_gpu_id not in new_workers:
+                        await worker.close()
+
+                self._pynv_workers = new_workers
+                self._codec_capabilities = capabilities
+                self._gpu_dispatch_order = dispatch_order or configured_gpu_ids
+                self._video_runtime_ready = True
+                return pynv
+            except Exception:
+                for worker in new_workers.values():
+                    with contextlib.suppress(Exception):
+                        await worker.close()
+                self._pynv_workers = {}
+                self._codec_capabilities = {}
+                self._gpu_dispatch_order = []
+                self._video_runtime_ready = False
+                raise
+
+    async def _restart_pynv_worker(self, gpu_id: int) -> None:
+        async with self._video_runtime_lock:
+            worker = self._pynv_workers.pop(gpu_id, None)
+            if worker is not None:
+                await worker.close()
+            replacement = self._create_persistent_worker(gpu_id, self._worker_slots_for_gpu(gpu_id))
+            await replacement.start()
+            self._pynv_workers[gpu_id] = replacement
+
+    def _create_persistent_worker(self, gpu_id: int, max_jobs: int) -> _PersistentPynvGpuWorker:
+        return _PersistentPynvGpuWorker(gpu_id, max_jobs)
+
+    def _probe_encoder_capabilities(self, pynv: ModuleType) -> dict[int, dict[str, VideoCodecCapabilities]]:
+        capabilities: dict[int, dict[str, VideoCodecCapabilities]] = {}
+        for gpu_id in self.options.gpu_ids or [0]:
+            capabilities[gpu_id] = {
+                "hevc": self._probe_codec_capabilities(pynv, gpu_id, "hevc"),
+                "av1": self._probe_codec_capabilities(pynv, gpu_id, "av1"),
+            }
+        return capabilities
+
+    def _probe_codec_capabilities(self, pynv: ModuleType, gpu_id: int, codec: str) -> VideoCodecCapabilities:
+        default_supported = codec == "hevc"
+        try:
+            raw = pynv.GetEncoderCaps(gpu_id, codec)
+        except Exception as e:
+            log(f"Unable to probe {codec.upper()} encoder caps for GPU {gpu_id}: {e}", 30)
+            return VideoCodecCapabilities(
+                codec=codec,
+                supported=default_supported,
+                num_encoder_engines=1,
+                num_max_bframes=max(int(self.options.bf), 0),
+            )
+
+        data = raw if isinstance(raw, dict) else vars(raw)
+        return VideoCodecCapabilities(
+            codec=codec,
+            supported=bool(data),
+            num_encoder_engines=max(int(data.get("num_encoder_engines", 1)), 1),
+            num_max_bframes=max(int(data.get("num_max_bframes", 0)), 0),
+            support_lookahead=bool(data.get("support_lookahead", 0)),
+            support_temporal_aq=bool(data.get("support_temporal_aq", 0)),
+            support_10bit_encode=bool(data.get("support_10bit_encode", 0)),
+        )
+
+    def _worker_slots_for_gpu(
+        self,
+        gpu_id: int,
+        capabilities: dict[str, VideoCodecCapabilities] | None = None,
+    ) -> int:
+        capabilities = capabilities or self._codec_capabilities.get(gpu_id, {})
+        configured_workers = max(int(self.options.video_workers_per_gpu), 1)
+        if not capabilities:
+            return configured_workers
+        encoder_engines = max(
+            (cap.num_encoder_engines for cap in capabilities.values() if cap.supported),
+            default=1,
+        )
+        return max(1, min(configured_workers, encoder_engines))
+
+    def _capabilities_for(self, gpu_id: int, codec: str) -> VideoCodecCapabilities:
+        capabilities = self._codec_capabilities.get(gpu_id, {})
+        if codec in capabilities:
+            return capabilities[codec]
+        return VideoCodecCapabilities(
+            codec=codec,
+            supported=(codec == "hevc"),
+            num_encoder_engines=max(int(self.options.video_workers_per_gpu), 1),
+            num_max_bframes=max(int(self.options.bf), 0),
+        )
+
+    def _coerce_effective_video_settings(
+        self,
+        settings: EffectiveVideoSettings | str,
+        cq: int | None = None,
+    ) -> EffectiveVideoSettings:
+        if isinstance(settings, EffectiveVideoSettings):
+            return settings if cq is None else replace(settings, cq=cq)
+
+        codec = settings.casefold()
+        return EffectiveVideoSettings(
+            profile="custom",
+            requested_profile="custom",
+            codec=codec,
+            cq=self._codec_cq(codec) if cq is None else cq,
+            bf=int(self.options.bf),
+            gop=int(self.options.gop),
+            idrperiod=int(self.options.idrperiod),
+            preset=self.options.preset,
+            tuning_info=self.options.tuning_info,
+        )
+
     def _effective_video_settings(self, gpu_id: int) -> EffectiveVideoSettings:
         options = self.options
         requested_profile = options.effective_video_profile()
+        hevc_caps = self._capabilities_for(gpu_id, "hevc")
+        av1_caps = self._capabilities_for(gpu_id, "av1")
 
-        if requested_profile == "av1_savings":
-            encoder = "nvenc_av1_10bit"
-            codec = "av1"
-            quality = int(options.av1_cq)
-            encoder_preset = options.handbrake_encoder_preset
-        else:
-            encoder = options.handbrake_encoder
-            codec = self._codec_from_handbrake_encoder(encoder)
-            quality = int(options.handbrake_quality)
-            encoder_preset = options.handbrake_encoder_preset
+        if requested_profile == "custom":
+            codec = options.video_codec
+            caps = av1_caps if codec == "av1" else hevc_caps
+            codec_supported = caps.supported or codec == "hevc"
+            return EffectiveVideoSettings(
+                profile="custom",
+                requested_profile=requested_profile,
+                codec=codec,
+                cq=self._codec_cq(codec),
+                bf=int(options.bf),
+                gop=int(options.gop),
+                idrperiod=int(options.idrperiod),
+                preset=options.preset,
+                tuning_info=options.tuning_info,
+                support_10bit_encode=caps.support_10bit_encode,
+                codec_supported=codec_supported,
+                unsupported_reason="" if codec_supported else f"{codec.upper()} encoding is not supported on GPU {gpu_id}",
+            )
 
-        effective_profile: VideoProfile = requested_profile
+        if requested_profile == "av1_savings" and av1_caps.supported:
+            return EffectiveVideoSettings(
+                profile="av1_savings",
+                requested_profile=requested_profile,
+                codec="av1",
+                cq=int(options.av1_cq),
+                bf=min(5, max(av1_caps.num_max_bframes, 0)),
+                gop=max(int(options.gop), 240),
+                idrperiod=max(int(options.idrperiod), 240),
+                preset="P5",
+                tuning_info="high_quality",
+                aq=True,
+                temporalaq=av1_caps.support_temporal_aq,
+                lookahead=16 if av1_caps.support_lookahead else 0,
+                support_10bit_encode=av1_caps.support_10bit_encode,
+            )
+
+        effective_profile: VideoProfile = "hevc_balanced"
+        downgraded_from: VideoProfile | None = "av1_savings" if requested_profile == "av1_savings" else None
         return EffectiveVideoSettings(
             profile=effective_profile,
             requested_profile=requested_profile,
-            codec=codec,
-            cq=quality,
-            bf=int(options.bf),
+            codec="hevc",
+            cq=int(options.hevc_cq),
+            bf=min(3, max(hevc_caps.num_max_bframes, 0)),
             gop=max(int(options.gop), 120),
             idrperiod=max(int(options.idrperiod), 120),
-            preset=encoder_preset,
-            tuning_info=options.handbrake_preset,
-            handbrake_encoder=encoder,
-            handbrake_preset=options.handbrake_preset,
-            handbrake_hw_decode=options.handbrake_hw_decode,
-            handbrake_all_audio=options.handbrake_all_audio,
-            handbrake_audio_encoder=options.handbrake_audio_encoder,
-            handbrake_audio_copy_mask=options.handbrake_audio_copy_mask,
-            handbrake_audio_fallback=options.handbrake_audio_fallback,
+            preset="P4",
+            tuning_info="high_quality",
             aq=True,
-            support_10bit_encode="10bit" in encoder,
+            temporalaq=False,
+            lookahead=10 if hevc_caps.support_lookahead else 0,
+            support_10bit_encode=hevc_caps.support_10bit_encode,
+            downgraded_from=downgraded_from,
         )
-
-    @staticmethod
-    def _codec_from_handbrake_encoder(encoder: str) -> str:
-        normalized = encoder.casefold()
-        if "av1" in normalized:
-            return "av1"
-        if "264" in normalized:
-            return "h264"
-        return "hevc"
 
     def _log_effective_video_settings(self, gpu_id: int, settings: EffectiveVideoSettings) -> None:
         key = (gpu_id, settings.requested_profile, settings.profile, settings.codec)
@@ -961,9 +1352,9 @@ class CompressionManager:
         log(
             "Compression profile "
             f"GPU {gpu_id}: requested={settings.requested_profile}, effective={settings.profile}{downgrade_note}, "
-            f"backend=handbrake, encoder={settings.handbrake_encoder}, codec={settings.codec}, "
-            f"quality={settings.cq}, encoder_preset={settings.preset}, hw_decode={int(settings.handbrake_hw_decode)}, "
-            f"app_preset={settings.handbrake_preset}",
+            f"codec={settings.codec}, cq={settings.cq}, bf={settings.bf}, preset={settings.preset}, "
+            f"lookahead={settings.lookahead}, aq={int(settings.aq)}, temporalaq={int(settings.temporalaq)}, "
+            f"support_10bit={int(settings.support_10bit_encode)}",
             20,
         )
 
@@ -997,24 +1388,9 @@ class CompressionManager:
         return None
 
     async def _replace_temp(self, temp_output: Path, source: Path) -> None:
-        if temp_output == source:
-            return
         for attempt in range(10):
             try:
                 await asyncio.to_thread(temp_output.replace, source)
-                return
-            except PermissionError:
-                if attempt == 9:
-                    raise
-                gc.collect()
-                await asyncio.sleep(0.25)
-
-    async def _delete_source_after_transcode(self, source: Path) -> None:
-        for attempt in range(10):
-            try:
-                await asyncio.to_thread(source.unlink)
-                return
-            except FileNotFoundError:
                 return
             except PermissionError:
                 if attempt == 9:
@@ -1060,33 +1436,29 @@ async def _noop_handle_completion(media_item: MediaItem, downloaded: bool = True
     return None
 
 
-def _tail_process_output(stdout: bytes, stderr: bytes, *, max_lines: int = 20) -> str:
-    output = b"\n".join(part for part in (stderr, stdout) if part)
-    text = output.decode("utf-8", errors="replace").strip()
-    if not text:
-        return ""
-    return "\n".join(text.splitlines()[-max_lines:])
-
-
-def _format_handbrake_exception(error: Exception) -> str:
+def _format_pynv_exception(error: Exception, stage: str = "input") -> str:
     message = str(error).strip()
     normalized = message.casefold()
-    if isinstance(error, FileNotFoundError) or "no such file" in normalized:
-        return "HandBrakeCLI executable was not found"
-    if "invalid data found when processing input" in normalized or "no title found" in normalized:
+    if "invalid data found when processing input" in normalized or "avformat_open_input" in normalized:
+        if stage == "output":
+            return "PyNvVideoCodec created an invalid output video at this CQ"
         return (
-            "HandBrakeCLI could not open the input video. "
+            "PyNvVideoCodec could not open the input video. "
             "The file is unsupported, corrupted, incomplete, or not a real video container."
         )
+    if "timescale not set" in normalized:
+        return "PyNvVideoCodec could not read this MP4 stream timing metadata"
+    if "error writing frame" in normalized:
+        return "PyNvVideoCodec failed while writing encoded frames"
     return message or error.__class__.__name__
 
 
-def _format_handbrake_failure(returncode: int, output: str) -> str:
+def _format_pynv_worker_failure(returncode: int, output: str) -> str:
     if output:
         return output
     if sys.platform == "win32":
-        return f"HandBrakeCLI failed with exit code {returncode} (0x{returncode & 0xFFFFFFFF:08X})"
-    return f"HandBrakeCLI failed with exit code {returncode}"
+        return f"PyNvVideoCodec worker failed with exit code {returncode} (0x{returncode & 0xFFFFFFFF:08X})"
+    return f"PyNvVideoCodec worker failed with exit code {returncode}"
 
 
 def _summarize_retry_errors(prefix: str, errors: list[str], *, max_errors: int = 3) -> str:
