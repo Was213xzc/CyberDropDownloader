@@ -297,10 +297,10 @@ class CompressionOptions(BaseModel):
     video_profile: NonEmptyStr = "hevc_balanced"
     video_backend: NonEmptyStr = "handbrake"
     handbrake_cli_path: NonEmptyStr = r"C:\Program Files\HandBrake\HandBrakeCLI.exe"
-    handbrake_preset: NonEmptyStr = "rtx_5070ti_h265_nvenc"
+    handbrake_preset: NonEmptyStr = "rtx_5070ti_speed_h265_nvenc"
     handbrake_encoder: NonEmptyStr = "nvenc_h265_10bit"
     handbrake_quality: NonNegativeInt = 24
-    handbrake_encoder_preset: NonEmptyStr = "slow"
+    handbrake_encoder_preset: NonEmptyStr = "fastest"
     handbrake_hw_decode: bool = True
     handbrake_all_audio: bool = True
     handbrake_audio_encoder: NonEmptyStr = "copy"

@@ -517,10 +517,12 @@ class CompressionManager:
         source = Path(source)
         if not await asyncio.to_thread(source.is_file):
             return False
+        if _has_compressed_marker(source.name):
+            return False
 
         ext = source.suffix.lower()
         if options.compress_videos and ext in FILE_FORMATS["Videos"]:
-            return not source.name.startswith(_COMPRESSED_MARKER)
+            return True
         if allow_images and options.compress_images and ext in FILE_FORMATS["Images"]:
             return True
         return False
@@ -547,6 +549,8 @@ class CompressionManager:
         source = await asyncio.to_thread(media_item.complete_file.resolve)
         if not await asyncio.to_thread(source.is_file):
             return None
+        if _has_compressed_marker(source.name):
+            return None
 
         ext = source.suffix.lower()
         if options.compress_videos and ext in FILE_FORMATS["Videos"]:
@@ -558,7 +562,7 @@ class CompressionManager:
 
         if result.status == "compressed" and result.final_size is not None:
             media_item.filesize = result.final_size
-        if result.status == "compressed" and result.media_type == "video":
+        if result.status == "compressed":
             result.path = await self._apply_compressed_marker(media_item, result.path)
         await self._record_result(media_item, result)
         return result
@@ -968,7 +972,7 @@ class CompressionManager:
         )
 
     async def _apply_compressed_marker(self, media_item: MediaItem, source: Path) -> Path:
-        if source.name.startswith(_COMPRESSED_MARKER):
+        if _has_compressed_marker(source.name):
             return source
 
         candidate = source.with_name(_COMPRESSED_MARKER + source.name)
@@ -1058,6 +1062,10 @@ async def _noop_process_completed(media_item: MediaItem, domain: str) -> None:
 
 async def _noop_handle_completion(media_item: MediaItem, downloaded: bool = True) -> None:
     return None
+
+
+def _has_compressed_marker(name: str) -> bool:
+    return name.casefold().startswith(_COMPRESSED_MARKER.casefold())
 
 
 def _tail_process_output(stdout: bytes, stderr: bytes, *, max_lines: int = 20) -> str:

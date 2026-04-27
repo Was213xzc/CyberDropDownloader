@@ -93,10 +93,10 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert options.video_profile == "hevc_balanced"
         assert options.video_backend == "handbrake"
         assert options.handbrake_cli_path == r"C:\Program Files\HandBrake\HandBrakeCLI.exe"
-        assert options.handbrake_preset == "rtx_5070ti_h265_nvenc"
+        assert options.handbrake_preset == "rtx_5070ti_speed_h265_nvenc"
         assert options.handbrake_encoder == "nvenc_h265_10bit"
         assert options.handbrake_quality == 24
-        assert options.handbrake_encoder_preset == "slow"
+        assert options.handbrake_encoder_preset == "fastest"
         assert options.handbrake_hw_decode is True
         assert options.ffmpeg_nvenc_fallback is False
         assert options.video_codec == "hevc"
@@ -123,7 +123,7 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         serialized_config = yaml.load(config_file)
         assert serialized_config["compression_options"]["video_profile"] == "hevc_balanced"
         assert serialized_config["compression_options"]["video_backend"] == "handbrake"
-        assert serialized_config["compression_options"]["handbrake_preset"] == "rtx_5070ti_h265_nvenc"
+        assert serialized_config["compression_options"]["handbrake_preset"] == "rtx_5070ti_speed_h265_nvenc"
         assert serialized_config["compression_options"]["handbrake_encoder"] == "nvenc_h265_10bit"
         assert serialized_config["compression_options"]["handbrake_quality"] == 24
         assert serialized_config["compression_options"]["video_codec"] == "hevc"
@@ -233,7 +233,7 @@ def test_handbrake_command_uses_rtx_5070ti_defaults() -> None:
     ]
     assert command[command.index("--encoder") + 1] == "nvenc_h265_10bit"
     assert command[command.index("--quality") + 1] == "24"
-    assert command[command.index("--encoder-preset") + 1] == "slow"
+    assert command[command.index("--encoder-preset") + 1] == "fastest"
     assert command[command.index("--enable-hw-decoding") + 1] == "nvdec"
     assert "--optimize" in command
     assert "--crop-mode" in command
@@ -254,9 +254,9 @@ def test_video_profile_selection_uses_handbrake_defaults() -> None:
     assert settings.bf == 3
     assert settings.gop == 120
     assert settings.idrperiod == 120
-    assert settings.preset == "slow"
+    assert settings.preset == "fastest"
     assert settings.handbrake_encoder == "nvenc_h265_10bit"
-    assert settings.handbrake_preset == "rtx_5070ti_h265_nvenc"
+    assert settings.handbrake_preset == "rtx_5070ti_speed_h265_nvenc"
     assert settings.handbrake_hw_decode is True
     assert settings.support_10bit_encode is True
 
@@ -271,7 +271,7 @@ def test_av1_profile_uses_handbrake_nvenc_av1_savings_profile() -> None:
     assert settings.profile == "av1_savings"
     assert settings.codec == "av1"
     assert settings.cq == 26
-    assert settings.preset == "slow"
+    assert settings.preset == "fastest"
     assert settings.handbrake_encoder == "nvenc_av1_10bit"
 
 
@@ -832,13 +832,16 @@ def test_image_compression_preserves_extension_and_replaces_only_when_smaller() 
 
         assert result is not None
         assert result.status == "compressed"
-        assert image_path.suffix == ".jpg"
-        assert image_path.stat().st_size < original_size
+        assert result.path.name == "[COMPRESSED] sample.jpg"
+        assert result.path.suffix == ".jpg"
+        assert result.path.stat().st_size < original_size
+        assert not image_path.exists()
         assert not image_path.with_name("sample.compressed.jpg").exists()
-        assert media_item.filesize == image_path.stat().st_size
-        with Image.open(image_path) as compressed_image:
+        assert media_item.complete_file == result.path
+        assert media_item.filesize == result.path.stat().st_size
+        with Image.open(result.path) as compressed_image:
             compressed_image.verify()
-        assert owner.progress_manager.results == [("compressed", original_size - image_path.stat().st_size)]
+        assert owner.progress_manager.results == [("compressed", original_size - result.path.stat().st_size)]
         assert owner.log_manager.rows[0]["media_type"] == "image"
     finally:
         shutil.rmtree(root, ignore_errors=True)
