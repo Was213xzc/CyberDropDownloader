@@ -36,6 +36,13 @@ def _gofile_file(name: str, mimetype: str | None = None) -> dict[str, object]:
     return file
 
 
+def _response(content_type: str, data: bytes = b"", filename: str | None = None) -> SimpleNamespace:
+    response = SimpleNamespace(content_type=content_type, read=mock.AsyncMock(return_value=data))
+    if filename:
+        response.filename = filename
+    return response
+
+
 async def test_gofile_startup_continues_with_configured_api_key_when_website_token_fails() -> None:
     crawler = GoFileCrawler(_manager("premium-token"))
     crawler.request_text = mock.AsyncMock(side_effect=TimeoutError)
@@ -63,8 +70,7 @@ async def test_gofile_extensionless_name_uses_normalized_mimetype() -> None:
 
 async def test_gofile_extensionless_name_uses_response_content_type() -> None:
     crawler = GoFileCrawler(_manager())
-    response = SimpleNamespace(content_type="video/mp4; charset=binary")
-    crawler.request = mock.Mock(return_value=_ResponseContext(response))
+    crawler.request = mock.Mock(return_value=_ResponseContext(_response("video/mp4; charset=binary")))
     link = crawler.parse_url("https://store9.gofile.io/download/web/file-id/clip")
 
     filename, ext = await crawler._get_filename_and_ext(_gofile_file("Clip Title"), link)
@@ -76,8 +82,24 @@ async def test_gofile_extensionless_name_uses_response_content_type() -> None:
 
 async def test_gofile_extensionless_name_uses_response_filename_extension() -> None:
     crawler = GoFileCrawler(_manager())
-    response = SimpleNamespace(content_type="application/octet-stream", filename="server-name.mp4")
-    crawler.request = mock.Mock(return_value=_ResponseContext(response))
+    crawler.request = mock.Mock(return_value=_ResponseContext(_response("application/octet-stream", filename="server-name.mp4")))
+    link = crawler.parse_url("https://store9.gofile.io/download/web/file-id/clip")
+
+    filename, ext = await crawler._get_filename_and_ext(_gofile_file("Clip Title"), link)
+
+    assert filename == "Clip Title.mp4"
+    assert ext == ".mp4"
+
+
+async def test_gofile_extensionless_name_ignores_html_header_and_sniffs_mp4_bytes() -> None:
+    crawler = GoFileCrawler(_manager())
+    header = b"\x00\x00\x00\x1cftypM4V \x00\x00\x00\x01isomavc1mp42"
+    crawler.request = mock.Mock(
+        side_effect=[
+            _ResponseContext(_response("text/html; charset=utf-8")),
+            _ResponseContext(_response("text/html; charset=utf-8", data=header)),
+        ]
+    )
     link = crawler.parse_url("https://store9.gofile.io/download/web/file-id/clip")
 
     filename, ext = await crawler._get_filename_and_ext(_gofile_file("Clip Title"), link)

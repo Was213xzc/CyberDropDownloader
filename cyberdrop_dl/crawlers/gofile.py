@@ -6,6 +6,7 @@ import re
 from hashlib import sha256
 from typing import TYPE_CHECKING, ClassVar, Literal, NotRequired, TypedDict, TypeGuard
 
+from cyberdrop_dl import constants
 from cyberdrop_dl.crawlers.crawler import Crawler, RateLimit, SupportedPaths
 from cyberdrop_dl.crawlers.generic import get_ext_from_content_type
 from cyberdrop_dl.data_structures.url_objects import FILE_HOST_ALBUM, AbsoluteHttpURL, ScrapeItem
@@ -228,7 +229,7 @@ class GoFileCrawler(Crawler):
     def _get_link_ext(self, link: AbsoluteHttpURL, mimetype: str | None) -> str | None:
         with contextlib.suppress(NoExtensionError, InvalidExtensionError):
             _, ext = get_filename_and_ext(link.name, mime_type=mimetype)
-            return ext
+            return _media_ext_or_none(ext)
         return None
 
     async def _get_response_ext(self, link: AbsoluteHttpURL) -> str | None:
@@ -239,8 +240,11 @@ class GoFileCrawler(Crawler):
                     if filename := _get_response_filename(resp):
                         with contextlib.suppress(NoExtensionError, InvalidExtensionError):
                             _, ext = get_filename_and_ext(filename)
-                            return ext
+                            if media_ext := _media_ext_or_none(ext):
+                                return media_ext
                     if ext := _get_ext_from_mimetype(resp.content_type):
+                        return ext
+                    if method == "GET" and (ext := _get_ext_from_signature(await resp.read())):
                         return ext
         return None
 
@@ -323,10 +327,30 @@ def _get_ext_from_mimetype(mimetype: str | None) -> str | None:
     mimetype = _normalize_mimetype(mimetype)
     if not mimetype:
         return None
-    return get_ext_from_content_type(mimetype)
+    return _media_ext_or_none(get_ext_from_content_type(mimetype))
 
 
 def _get_response_filename(resp: object) -> str | None:
     with contextlib.suppress(AttributeError, AssertionError, KeyError):
         return resp.filename
+    return None
+
+
+def _media_ext_or_none(ext: str | None) -> str | None:
+    if ext and ext.lower() in constants.MEDIA_EXTENSIONS:
+        return ext.lower()
+    return None
+
+
+def _get_ext_from_signature(data: bytes) -> str | None:
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return ".mp4"
+    if data.startswith(b"\x1a\x45\xdf\xa3"):
+        return ".webm"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
     return None
