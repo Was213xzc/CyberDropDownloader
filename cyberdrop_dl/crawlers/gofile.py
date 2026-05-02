@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-import asyncio
+import contextlib
 import itertools
 import re
 from hashlib import sha256
 from typing import TYPE_CHECKING, ClassVar, Literal, NotRequired, TypedDict, TypeGuard
 
 from cyberdrop_dl.crawlers.crawler import Crawler, RateLimit, SupportedPaths
+from cyberdrop_dl.crawlers.generic import get_ext_from_content_type
 from cyberdrop_dl.data_structures.url_objects import FILE_HOST_ALBUM, AbsoluteHttpURL, ScrapeItem
-from cyberdrop_dl.exceptions import PasswordProtectedError, ScrapeError
-from cyberdrop_dl.utils.utilities import error_handling_wrapper
+from cyberdrop_dl.exceptions import InvalidExtensionError, NoExtensionError, PasswordProtectedError, ScrapeError
+from cyberdrop_dl.utils.utilities import error_handling_wrapper, get_filename_and_ext
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterable
@@ -45,6 +46,7 @@ class File(UnlockedNode):
     directLink: NotRequired[str]  # Only present in overloaded files (imported)
     isFrozen: NotRequired[bool]  # Only present in files uploaded by free accounts and older than 30 days
     viruses: NotRequired[bool]
+    mimetype: NotRequired[str]
     md5: str
 
     # parentFolder: str
@@ -208,17 +210,57 @@ class GoFileCrawler(Crawler):
         if file.get("isFrozen"):
             self.log(f"{link} is marked as frozen, download may fail", 30)
 
-        filename, ext = self.get_filename_and_ext(file["name"], mime_type=file.get("mimetype"))
+        filename, ext = await self._get_filename_and_ext(file, link)
         scrape_item.possible_datetime = file["createTime"]
         await self.handle_file(link, scrape_item, file["name"], ext, custom_filename=filename, metadata=file)
+
+    async def _get_filename_and_ext(self, file: File, link: AbsoluteHttpURL) -> tuple[str, str]:
+        name = file["name"]
+        mimetype = _normalize_mimetype(file.get("mimetype"))
+        try:
+            return get_filename_and_ext(name, mime_type=mimetype)
+        except NoExtensionError as no_ext_error:
+            ext = self._get_link_ext(link, mimetype) or await self._get_response_ext(link)
+            if not ext:
+                raise no_ext_error
+            return get_filename_and_ext(f"{name}{ext}")
+
+    def _get_link_ext(self, link: AbsoluteHttpURL, mimetype: str | None) -> str | None:
+        with contextlib.suppress(NoExtensionError, InvalidExtensionError):
+            _, ext = get_filename_and_ext(link.name, mime_type=mimetype)
+            return ext
+        return None
+
+    async def _get_response_ext(self, link: AbsoluteHttpURL) -> str | None:
+        for method, headers in _EXTENSION_PROBE_REQUESTS:
+            with contextlib.suppress(Exception):
+                request_headers = dict(headers) if headers else None
+                async with self.request(link, method=method, headers=request_headers, cache_disabled=True) as resp:
+                    if filename := _get_response_filename(resp):
+                        with contextlib.suppress(NoExtensionError, InvalidExtensionError):
+                            _, ext = get_filename_and_ext(filename)
+                            return ext
+                    if ext := _get_ext_from_mimetype(resp.content_type):
+                        return ext
+        return None
 
     @error_handling_wrapper
     async def _get_credentials(self, _) -> None:
         """Gets the token for the API."""
-        with self.disable_on_error("Unable to get website token"):
-            api_key, token = await asyncio.gather(self._get_api_key(), self._get_website_token())
-            self.headers = {"Authorization": f"Bearer {api_key}", "X-Website-Token": token}
-            self.update_cookies({"accountToken": api_key})
+        api_key = await self._get_api_key()
+        self.headers = {"Authorization": f"Bearer {api_key}"}
+        self.update_cookies({"accountToken": api_key})
+
+        try:
+            token = await self._get_website_token()
+        except Exception:
+            if self.manager.auth_config.gofile.api_key:
+                self.log("[GoFile] Unable to get website token; continuing with configured API key only", 30)
+                return
+            with self.disable_on_error("Unable to get website token"):
+                raise
+
+        self.headers["X-Website-Token"] = token
 
     async def _get_api_key(self) -> str:
         if key := self.manager.auth_config.gofile.api_key:
@@ -262,3 +304,29 @@ def _check_node_is_accessible(node: Node) -> TypeGuard[File | Folder]:
 
 def _has_single_not_nested_file(scrape_item: ScrapeItem, folder: Folder) -> bool:
     return folder["childrenCount"] == 1 and folder["name"] == folder["code"] and scrape_item.type != FILE_HOST_ALBUM
+
+
+_EXTENSION_PROBE_REQUESTS = (
+    ("HEAD", None),
+    ("GET", {"Range": "bytes=0-0"}),
+)
+
+
+def _normalize_mimetype(mimetype: str | None) -> str | None:
+    if not mimetype:
+        return None
+    mimetype = mimetype.split(";", 1)[0].strip().lower()
+    return mimetype or None
+
+
+def _get_ext_from_mimetype(mimetype: str | None) -> str | None:
+    mimetype = _normalize_mimetype(mimetype)
+    if not mimetype:
+        return None
+    return get_ext_from_content_type(mimetype)
+
+
+def _get_response_filename(resp: object) -> str | None:
+    with contextlib.suppress(AttributeError, AssertionError, KeyError):
+        return resp.filename
+    return None
