@@ -1518,6 +1518,21 @@ def test_pending_compression_file_round_trip_and_pending_count() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_pending_compression_file_allows_utf8_bom() -> None:
+    root = _reset_test_dir()
+    try:
+        pending_file = root / "compression_pending.json"
+        existing = root / "video.mp4"
+        pending_file.write_text(f"\ufeff{json.dumps([str(existing)])}", encoding="utf-8")
+
+        owner = _owner_with_pending_file(pending_file)
+        compression_manager = CompressionManager(cast("Any", owner))
+
+        assert compression_manager._read_pending_file() == [str(existing)]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_resume_skips_missing_files_and_requeues_existing_on_startup() -> None:
     root = _reset_test_dir()
     try:

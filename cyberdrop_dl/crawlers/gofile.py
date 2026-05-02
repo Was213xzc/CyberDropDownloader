@@ -235,7 +235,7 @@ class GoFileCrawler(Crawler):
     async def _get_response_ext(self, link: AbsoluteHttpURL) -> str | None:
         for method, headers in _EXTENSION_PROBE_REQUESTS:
             with contextlib.suppress(Exception):
-                request_headers = dict(headers) if headers else None
+                request_headers = self._extension_probe_headers(headers)
                 async with self.request(link, method=method, headers=request_headers, cache_disabled=True) as resp:
                     if filename := _get_response_filename(resp):
                         with contextlib.suppress(NoExtensionError, InvalidExtensionError):
@@ -247,6 +247,12 @@ class GoFileCrawler(Crawler):
                     if method == "GET" and (ext := _get_ext_from_signature(await resp.read())):
                         return ext
         return None
+
+    def _extension_probe_headers(self, headers: dict[str, str] | None) -> dict[str, str] | None:
+        request_headers = dict(self.headers)
+        if headers:
+            request_headers.update(headers)
+        return request_headers or None
 
     @error_handling_wrapper
     async def _get_credentials(self, _) -> None:
@@ -312,7 +318,7 @@ def _has_single_not_nested_file(scrape_item: ScrapeItem, folder: Folder) -> bool
 
 _EXTENSION_PROBE_REQUESTS = (
     ("HEAD", None),
-    ("GET", {"Range": "bytes=0-0"}),
+    ("GET", {"Range": "bytes=0-63"}),
 )
 
 

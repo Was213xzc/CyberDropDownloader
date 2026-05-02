@@ -501,7 +501,7 @@ class CompressionManager:
         if target is None or not target.is_file():
             return []
         try:
-            data = json.loads(target.read_text(encoding="utf-8"))
+            data = json.loads(target.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError) as e:
             log(f"Unable to read pending compression list: {e}", 30)
             return []
