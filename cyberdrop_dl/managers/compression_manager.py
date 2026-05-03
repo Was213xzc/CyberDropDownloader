@@ -891,7 +891,11 @@ class CompressionManager:
             await self._delete_temp(temp_output)
             return CompressionResult(status="skipped", error="Compressed output was not small enough", **result_kwargs)
 
-        await self._replace_temp(temp_output, source)
+        if output_type == "video":
+            final_path = await self._promote_video_output(temp_output, source)
+            result_kwargs["path"] = final_path
+        else:
+            await self._replace_temp(temp_output, source)
         return CompressionResult(status="compressed", **result_kwargs)
 
     async def _validate_video(self, path: Path) -> None:
@@ -1360,6 +1364,8 @@ class CompressionManager:
 
     async def _apply_compressed_marker(self, media_item: MediaItem, source: Path) -> Path:
         if source.name.startswith(_COMPRESSED_MARKER):
+            media_item.complete_file = source
+            media_item.download_filename = source.name
             return source
 
         candidate = source.with_name(_COMPRESSED_MARKER + source.name)
@@ -1377,6 +1383,17 @@ class CompressionManager:
 
         media_item.complete_file = candidate
         media_item.download_filename = candidate.name
+        return candidate
+
+    async def _promote_video_output(self, temp_output: Path, source: Path) -> Path:
+        candidate = source.with_name(_COMPRESSED_MARKER + source.name)
+        if await asyncio.to_thread(candidate.exists):
+            candidate = await asyncio.to_thread(self._next_available_marked_name, source)
+            if candidate is None:
+                raise OSError(f"Unable to find a free [COMPRESSED] filename for {source}")
+
+        await self._replace_temp(temp_output, candidate)
+        await self._delete_original_after_promotion(source, candidate)
         return candidate
 
     def _next_available_marked_name(self, source: Path) -> Path | None:
@@ -1397,6 +1414,21 @@ class CompressionManager:
                     raise
                 gc.collect()
                 await asyncio.sleep(0.25)
+
+    async def _delete_original_after_promotion(self, source: Path, promoted: Path) -> None:
+        for attempt in range(10):
+            try:
+                await asyncio.to_thread(source.unlink, missing_ok=True)
+                return
+            except PermissionError:
+                if attempt == 9:
+                    log(f"Compressed file was written to {promoted}, but original is still locked: {source}", 30)
+                    return
+                gc.collect()
+                await asyncio.sleep(0.25)
+            except OSError as e:
+                log(f"Compressed file was written to {promoted}, but original could not be removed: {e}", 30)
+                return
 
     async def _delete_temp(self, temp_output: Path) -> None:
         for attempt in range(10):

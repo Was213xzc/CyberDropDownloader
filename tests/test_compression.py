@@ -736,6 +736,42 @@ def test_compressed_marker_is_idempotent_when_prefix_already_present() -> None:
         result_path = asyncio.run(manager._apply_compressed_marker(media_item, already_marked))
         assert result_path == already_marked
         assert already_marked.exists()
+        assert media_item.complete_file == already_marked
+        assert media_item.download_filename == already_marked.name
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_video_finalize_promotes_temp_to_compressed_marker_and_removes_original() -> None:
+    root = _reset_test_dir()
+    try:
+        source = root / "clip.mp4"
+        temp_output = root / "clip.compressed.mp4"
+        source.write_bytes(b"x" * 100)
+        temp_output.write_bytes(b"x" * 50)
+        compression_manager = CompressionManager(cast("Any", FakeCompressionOwner(CompressionOptions())))
+
+        async def validate_video(path: Path) -> None:
+            assert path == temp_output
+
+        compression_manager._validate_video = validate_video
+        result = asyncio.run(
+            compression_manager._finalize_output(
+                source,
+                temp_output,
+                "video",
+                media_type="video",
+                backend="pynv",
+                path=source,
+            )
+        )
+
+        promoted = root / "[COMPRESSED] clip.mp4"
+        assert result.status == "compressed"
+        assert result.path == promoted
+        assert promoted.read_bytes() == b"x" * 50
+        assert not source.exists()
+        assert not temp_output.exists()
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
