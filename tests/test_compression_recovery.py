@@ -111,6 +111,63 @@ def test_existing_file_recovery_queues_uncompressed_video_but_not_marked_video()
         root.rmdir()
 
 
+def test_existing_compressed_pair_removes_duplicate_source_and_updates_completion() -> None:
+    root = _reset_test_dir()
+    try:
+        owner = FakeCompressionOwner(CompressionOptions())
+        manager = CompressionManager(cast("Any", owner))
+        callbacks: list[tuple[str, Any, Any, Any]] = []
+
+        source = root / "video.mp4"
+        marked = root / "[COMPRESSED] video.mp4"
+        source.write_bytes(b"x" * 100)
+        marked.write_bytes(b"x" * 50)
+
+        media_item = cast(
+            "Any",
+            SimpleNamespace(
+                complete_file=source,
+                download_folder=root,
+                filename="video.mp4",
+                download_filename="video.mp4",
+                filesize=100,
+                is_segment=False,
+            ),
+        )
+
+        async def process_completed(media_item: Any, domain: str) -> None:
+            callbacks.append(("process", domain, media_item.complete_file, media_item.download_filename))
+
+        async def handle_completion(media_item: Any, downloaded: bool = False) -> None:
+            callbacks.append(("handle", downloaded, media_item.complete_file, media_item.filesize))
+
+        handled = asyncio.run(
+            manager.enqueue_existing_file_if_needed(
+                "example.com",
+                media_item,
+                process_completed,
+                handle_completion,
+                downloaded=False,
+                allow_images=False,
+            )
+        )
+
+        assert handled is True
+        assert not source.exists()
+        assert marked.exists()
+        assert media_item.complete_file == marked
+        assert media_item.download_filename == marked.name
+        assert media_item.filesize == 50
+        assert callbacks == [
+            ("process", "example.com", marked, marked.name),
+            ("handle", False, marked, 50),
+        ]
+    finally:
+        for path in root.glob("*"):
+            path.unlink(missing_ok=True)
+        root.rmdir()
+
+
 def test_download_client_requeues_existing_local_file_for_compression() -> None:
     root = _reset_test_dir()
     try:

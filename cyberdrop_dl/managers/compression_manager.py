@@ -305,6 +305,7 @@ class CompressionManager:
         self._logged_video_settings: set[tuple[int, VideoProfile, VideoProfile, str]] = set()
         self._pending_paths: set[str] = set()
         self._pending_lock = asyncio.Lock()
+        self._deferred_original_deletes: dict[Path, Path] = {}
         # queue.join() only covers items that have already been put on the queue.
         # Track in-flight producers so shutdown also waits for late enqueues and resume requeues.
         self._active_producers = 0
@@ -399,6 +400,15 @@ class CompressionManager:
         downloaded: bool = False,
         allow_images: bool = True,
     ) -> bool:
+        if await self._complete_existing_compressed_pair(
+            domain,
+            media_item,
+            process_completed,
+            handle_completion,
+            downloaded=downloaded,
+        ):
+            return True
+
         if not await self._should_enqueue_existing_file(media_item, allow_images=allow_images):
             return False
 
@@ -707,6 +717,67 @@ class CompressionManager:
         if allow_images and options.compress_images and ext in FILE_FORMATS["Images"]:
             return True
         return False
+
+    async def _complete_existing_compressed_pair(
+        self,
+        domain: str,
+        media_item: MediaItem,
+        process_completed: Callable[[MediaItem, str], Awaitable[None]],
+        handle_completion: Callable[[MediaItem, bool], Awaitable[None]],
+        *,
+        downloaded: bool,
+    ) -> bool:
+        pair = await self._existing_compressed_pair(media_item)
+        if pair is None:
+            return False
+
+        source, marked = pair
+        log(f"Found existing compressed file {marked.name}; removing duplicate source {source.name}", 20)
+        deleted = await self._try_unlink_source(
+            source,
+            locked_context=f"Using existing compressed file {marked}, but duplicate source is still locked",
+            error_context=f"Using existing compressed file {marked}, but duplicate source could not be removed",
+        )
+        if not deleted:
+            self._deferred_original_deletes[source] = marked
+
+        media_item.complete_file = marked
+        media_item.download_filename = marked.name
+        media_item.filesize = await asyncio.to_thread(lambda: marked.stat().st_size)
+        await process_completed(media_item, domain)
+        await handle_completion(media_item, downloaded=downloaded)
+        return True
+
+    async def _existing_compressed_pair(self, media_item: MediaItem) -> tuple[Path, Path] | None:
+        options = self.options
+        if not options.enabled or media_item.is_segment:
+            return None
+
+        source = getattr(media_item, "complete_file", None)
+        if source is None:
+            filename = media_item.download_filename or media_item.filename
+            source = media_item.download_folder / filename
+            media_item.complete_file = source
+        source = Path(source)
+        if source.name.startswith(_COMPRESSED_MARKER):
+            return None
+
+        ext = source.suffix.lower()
+        if not options.compress_videos or ext not in FILE_FORMATS["Videos"]:
+            return None
+
+        marked = source.with_name(_COMPRESSED_MARKER + source.name)
+
+        def source_and_marked_are_files() -> bool:
+            if not source.is_file() or not marked.is_file():
+                return False
+            source_size = source.stat().st_size
+            marked_size = marked.stat().st_size
+            return 0 < marked_size < source_size
+
+        if not await asyncio.to_thread(source_and_marked_are_files):
+            return None
+        return source, marked
 
     def _producer_started(self) -> None:
         self._active_producers += 1
@@ -1143,6 +1214,7 @@ class CompressionManager:
         self._gpu_dispatch_order.clear()
         self._video_semaphores.clear()
         self._logged_video_settings.clear()
+        await self._flush_deferred_original_deletes()
 
     async def _ensure_video_runtime(self) -> ModuleType | None:
         if self._video_runtime_ready and self._pynv_workers:
@@ -1416,19 +1488,56 @@ class CompressionManager:
                 await asyncio.sleep(0.25)
 
     async def _delete_original_after_promotion(self, source: Path, promoted: Path) -> None:
-        for attempt in range(10):
+        deleted = await self._try_unlink_source(
+            source,
+            locked_context=f"Compressed file was written to {promoted}, but original is still locked",
+            error_context=f"Compressed file was written to {promoted}, but original could not be removed",
+        )
+        if not deleted:
+            self._deferred_original_deletes[source] = promoted
+
+    async def _try_unlink_source(
+        self,
+        source: Path,
+        *,
+        attempts: int = 10,
+        retry_delay: float = 0.25,
+        locked_context: str,
+        error_context: str,
+    ) -> bool:
+        for attempt in range(attempts):
             try:
                 await asyncio.to_thread(source.unlink, missing_ok=True)
-                return
+                return True
             except PermissionError:
-                if attempt == 9:
-                    log(f"Compressed file was written to {promoted}, but original is still locked: {source}", 30)
-                    return
+                if attempt == attempts - 1:
+                    log(f"{locked_context}: {source}", 30)
+                    return False
                 gc.collect()
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(retry_delay)
             except OSError as e:
-                log(f"Compressed file was written to {promoted}, but original could not be removed: {e}", 30)
-                return
+                log(f"{error_context}: {e}", 30)
+                return False
+        return False
+
+    async def _flush_deferred_original_deletes(self) -> None:
+        if not self._deferred_original_deletes:
+            return
+
+        pending = self._deferred_original_deletes
+        self._deferred_original_deletes = {}
+        for source, promoted in pending.items():
+            if not await asyncio.to_thread(source.exists):
+                continue
+            deleted = await self._try_unlink_source(
+                source,
+                attempts=20,
+                retry_delay=0.5,
+                locked_context=f"Compressed file exists at {promoted}, but original is still locked after shutdown",
+                error_context=f"Compressed file exists at {promoted}, but original could not be removed after shutdown",
+            )
+            if not deleted:
+                self._deferred_original_deletes[source] = promoted
 
     async def _delete_temp(self, temp_output: Path) -> None:
         for attempt in range(10):

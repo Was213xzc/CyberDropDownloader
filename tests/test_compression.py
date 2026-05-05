@@ -776,6 +776,47 @@ def test_video_finalize_promotes_temp_to_compressed_marker_and_removes_original(
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_locked_original_delete_is_retried_after_runtime_close() -> None:
+    root = _reset_test_dir()
+    try:
+        source = root / "clip.mp4"
+        promoted = root / "[COMPRESSED] clip.mp4"
+        source.write_bytes(b"x" * 100)
+        promoted.write_bytes(b"x" * 50)
+        compression_manager = CompressionManager(cast("Any", FakeCompressionOwner(CompressionOptions())))
+        attempt_values: list[int] = []
+
+        async def fake_try_unlink_source(
+            source_path: Path,
+            *,
+            attempts: int = 10,
+            retry_delay: float = 0.25,
+            locked_context: str,
+            error_context: str,
+        ) -> bool:
+            del retry_delay, locked_context, error_context
+            attempt_values.append(attempts)
+            if len(attempt_values) == 1:
+                return False
+            source_path.unlink(missing_ok=True)
+            return True
+
+        compression_manager._try_unlink_source = fake_try_unlink_source  # type: ignore[method-assign]
+
+        asyncio.run(compression_manager._delete_original_after_promotion(source, promoted))
+
+        assert source.exists()
+        assert compression_manager._deferred_original_deletes == {source: promoted}
+
+        asyncio.run(compression_manager._close_video_runtime())
+
+        assert attempt_values == [10, 20]
+        assert not source.exists()
+        assert compression_manager._deferred_original_deletes == {}
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_compressed_marker_picks_counter_suffix_on_collision() -> None:
     root = _reset_test_dir()
     try:
