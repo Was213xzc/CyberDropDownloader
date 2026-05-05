@@ -379,8 +379,10 @@ def test_pynv_worker_stringifies_config_and_resolves_segment_output() -> None:
         expected_output = root / "video.compressed.mp4"
         segmented_output = root / "video.compressed_0.000000_4.404400.mp4"
         faststart_output = segmented_output.with_suffix(segmented_output.suffix + ".faststart")
+        repair_output = segmented_output.with_suffix(segmented_output.suffix + ".repair")
         segmented_output.write_bytes(b"compressed")
         faststart_output.write_bytes(b"faststart")
+        repair_output.write_bytes(b"repair")
 
         assert _stringify_config({"constqp": 23, "usedevicememory": True}) == {
             "constqp": "23",
@@ -388,6 +390,7 @@ def test_pynv_worker_stringifies_config_and_resolves_segment_output() -> None:
         }
         assert _resolve_output(str(expected_output)) == segmented_output
         assert faststart_output in _candidate_outputs_for_cleanup(expected_output)
+        assert repair_output in _candidate_outputs_for_cleanup(expected_output)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -1026,6 +1029,24 @@ def test_resolve_pynv_timestamped_segment_output() -> None:
         compression_manager = CompressionManager(cast("Any", FakeCompressionOwner()))
 
         assert compression_manager._resolve_pynv_output(source, expected_output) == timestamped_output
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_temp_output_cleanup_includes_repair_outputs() -> None:
+    root = _reset_test_dir()
+    try:
+        expected_output = root / "video.compressed.mp4"
+        timestamped_output = root / "video.compressed_0.00_12.50.mp4"
+        repair_output = timestamped_output.with_suffix(timestamped_output.suffix + ".repair")
+        timestamped_output.write_bytes(b"compressed")
+        repair_output.write_bytes(b"repair")
+        compression_manager = CompressionManager(cast("Any", FakeCompressionOwner()))
+
+        candidates = compression_manager._temp_output_cleanup_candidates(expected_output)
+
+        assert timestamped_output in candidates
+        assert repair_output in candidates
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

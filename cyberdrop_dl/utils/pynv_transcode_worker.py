@@ -120,7 +120,11 @@ def _candidate_outputs_for_cleanup(template: Path) -> list[Path]:
     candidates = []
     seen: set[Path] = set()
     for path in _candidate_outputs(template):
-        for candidate in (path, path.with_suffix(path.suffix + ".faststart")):
+        for candidate in (
+            path,
+            path.with_suffix(path.suffix + ".faststart"),
+            path.with_suffix(path.suffix + ".repair"),
+        ):
             if candidate not in seen:
                 candidates.append(candidate)
                 seen.add(candidate)

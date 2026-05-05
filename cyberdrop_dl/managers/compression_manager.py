@@ -1562,7 +1562,11 @@ class CompressionManager:
             path for path in temp_output.parent.glob(f"{temp_output.stem}*{temp_output.suffix}") if path != temp_output
         )
         for path in timestamped_outputs:
-            for candidate in (path, path.with_suffix(path.suffix + ".faststart")):
+            for candidate in (
+                path,
+                path.with_suffix(path.suffix + ".faststart"),
+                path.with_suffix(path.suffix + ".repair"),
+            ):
                 if candidate not in seen:
                     candidates.append(candidate)
                     seen.add(candidate)
