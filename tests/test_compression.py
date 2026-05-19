@@ -110,6 +110,7 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert CompressionOptions.model_validate({"video_workers_per_gpu": 0}).video_workers_per_gpu == 1
         assert CompressionOptions.model_validate({"video_profile": "AV1_SAVINGS"}).video_profile == "av1_savings"
         assert CompressionOptions.model_validate({"video_codec": "AV1"}).video_codec == "av1"
+        assert CompressionOptions.model_validate({"video_backend": "handbrake"}).video_backend == "pynv"
         assert CompressionOptions().effective_video_profile() == "hevc_balanced"
         assert CompressionOptions(video_profile="custom").effective_video_profile() == "custom"
         assert CompressionOptions(preset="P4").effective_video_profile() == "custom"

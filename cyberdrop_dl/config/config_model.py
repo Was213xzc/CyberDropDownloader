@@ -318,9 +318,12 @@ class CompressionOptions(BaseModel):
     @field_validator("video_backend", mode="after")
     @classmethod
     def validate_video_backend(cls, value: str) -> str:
-        if value.casefold() != "pynv":
+        backend = value.casefold()
+        if backend == "handbrake":
+            return "pynv"
+        if backend != "pynv":
             raise ValueError("only 'pynv' is supported")
-        return value.casefold()
+        return backend
 
     @field_validator("video_profile", mode="after")
     @classmethod
