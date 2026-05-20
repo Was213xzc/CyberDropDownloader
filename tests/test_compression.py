@@ -483,6 +483,49 @@ def test_pynv_worker_rejects_outputs_that_cannot_be_decoded(monkeypatch) -> None
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_pynv_worker_rejects_outputs_when_last_frame_cannot_be_decoded(monkeypatch) -> None:
+    root = _reset_test_dir()
+    try:
+        source = root / "input.mkv"
+        output = root / "output.mkv"
+        source.write_bytes(b"source")
+
+        class FakeDecoder:
+            def __init__(self, path: str, gpu_id: int = 0, use_device_memory: bool = False) -> None:
+                self.path = Path(path)
+
+            def get_stream_metadata(self) -> SimpleNamespace:
+                return SimpleNamespace(duration=10.0, num_frames=100)
+
+            def __getitem__(self, index: int) -> bytes:
+                if self.path == output and index == 99:
+                    raise RuntimeError("end of stream decode failed")
+                return b"frame"
+
+        class FakeTranscoder:
+            def __init__(
+                self,
+                enc_file_path: str,
+                muxed_file_path: str,
+                gpu_id: int,
+                cuda_context: int,
+                cuda_stream: int,
+                **kwargs: Any,
+            ) -> None:
+                self.output = Path(muxed_file_path)
+
+            def transcode_with_mux(self) -> None:
+                self.output.write_bytes(b"broken-near-end")
+
+        fake_pynv = SimpleNamespace(Transcoder=FakeTranscoder, SimpleDecoder=FakeDecoder)
+        monkeypatch.setitem(sys.modules, "PyNvVideoCodec", fake_pynv)
+
+        assert pynv_worker_main([str(source), str(output), "0", '{"codec": "hevc"}']) == 1
+        assert not output.exists()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_mp4_faststart_moves_moov_before_mdat_and_patches_offsets() -> None:
     root = _reset_test_dir()
     try:
@@ -817,6 +860,35 @@ def test_locked_original_delete_is_retried_after_runtime_close() -> None:
         assert attempt_values == [10, 20]
         assert not source.exists()
         assert compression_manager._deferred_original_deletes == {}
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_locked_temp_delete_is_deferred_and_retried_after_runtime_close() -> None:
+    root = _reset_test_dir()
+    try:
+        temp_output = root / "clip.compressed.mp4"
+        temp_output.write_bytes(b"x" * 50)
+        compression_manager = CompressionManager(cast("Any", FakeCompressionOwner(CompressionOptions())))
+        calls: list[Path] = []
+
+        def fake_delete_temp_outputs(path: Path) -> None:
+            calls.append(path)
+            if len(calls) <= 10:
+                raise PermissionError("locked")
+            path.unlink(missing_ok=True)
+
+        compression_manager._delete_temp_outputs = fake_delete_temp_outputs  # type: ignore[method-assign]
+
+        assert asyncio.run(compression_manager._delete_temp(temp_output)) is False
+        assert temp_output.exists()
+        assert compression_manager._deferred_temp_deletes == {temp_output}
+
+        asyncio.run(compression_manager._close_video_runtime())
+
+        assert calls == [temp_output] * 11
+        assert not temp_output.exists()
+        assert compression_manager._deferred_temp_deletes == set()
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

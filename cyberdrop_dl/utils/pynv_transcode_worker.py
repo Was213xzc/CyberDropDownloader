@@ -548,6 +548,9 @@ def _validate_output(pynv_module, output: str, gpu_id: int) -> None:
         if duration <= 0:
             raise RuntimeError("PyNvVideoCodec output validation failed: zero duration")
         _ = decoder[0]
+        num_frames = int(getattr(metadata, "num_frames", 0) or 0)
+        if num_frames > 1:
+            _ = decoder[num_frames - 1]
     finally:
         del decoder
         gc.collect()

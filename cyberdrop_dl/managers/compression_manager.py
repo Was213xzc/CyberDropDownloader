@@ -306,6 +306,7 @@ class CompressionManager:
         self._pending_paths: set[str] = set()
         self._pending_lock = asyncio.Lock()
         self._deferred_original_deletes: dict[Path, Path] = {}
+        self._deferred_temp_deletes: set[Path] = set()
         # queue.join() only covers items that have already been put on the queue.
         # Track in-flight producers so shutdown also waits for late enqueues and resume requeues.
         self._active_producers = 0
@@ -862,7 +863,12 @@ class CompressionManager:
             attempt_settings = replace(settings, cq=attempt_cq)
             attempt_kwargs = result_kwargs | {"cq": attempt_cq, "bf": attempt_settings.bf}
             temp_output = temp_output_template
-            await self._delete_temp(temp_output)
+            if not await self._delete_temp(temp_output):
+                return CompressionResult(
+                    status="skipped",
+                    error="Temporary compression output is locked",
+                    **attempt_kwargs,
+                )
             try:
                 async with self._video_slot(gpu_id):
                     await self._transcode_with_pynv_subprocess(source, temp_output, gpu_id, attempt_settings)
@@ -892,7 +898,12 @@ class CompressionManager:
         result_kwargs = {"media_type": "image", "backend": "pillow", "path": source}
         temp_output = self._temp_output_template(source)
         try:
-            await self._delete_temp(temp_output)
+            if not await self._delete_temp(temp_output):
+                return CompressionResult(
+                    status="skipped",
+                    error="Temporary compression output is locked",
+                    **result_kwargs,
+                )
             await asyncio.to_thread(self._save_image_optimized, source, temp_output)
             return await self._finalize_output(source, temp_output, "image", **result_kwargs)
         except Exception as e:
@@ -1214,6 +1225,7 @@ class CompressionManager:
         self._gpu_dispatch_order.clear()
         self._video_semaphores.clear()
         self._logged_video_settings.clear()
+        await self._flush_deferred_temp_deletes()
         await self._flush_deferred_original_deletes()
 
     async def _ensure_video_runtime(self) -> ModuleType | None:
@@ -1539,16 +1551,44 @@ class CompressionManager:
             if not deleted:
                 self._deferred_original_deletes[source] = promoted
 
-    async def _delete_temp(self, temp_output: Path) -> None:
-        for attempt in range(10):
+    async def _delete_temp(
+        self,
+        temp_output: Path,
+        *,
+        attempts: int = 10,
+        retry_delay: float = 0.25,
+        defer: bool = True,
+    ) -> bool:
+        for attempt in range(attempts):
             try:
                 await asyncio.to_thread(self._delete_temp_outputs, temp_output)
-                return
+                self._deferred_temp_deletes.discard(temp_output)
+                return True
             except PermissionError:
-                if attempt == 9:
-                    raise
+                if attempt == attempts - 1:
+                    log(f"Temporary compression output is still locked: {temp_output}", 30)
+                    if defer:
+                        self._deferred_temp_deletes.add(temp_output)
+                    return False
                 gc.collect()
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(retry_delay)
+            except OSError as e:
+                log(f"Temporary compression output could not be removed: {e}", 30)
+                if defer:
+                    self._deferred_temp_deletes.add(temp_output)
+                return False
+        return False
+
+    async def _flush_deferred_temp_deletes(self) -> None:
+        if not self._deferred_temp_deletes:
+            return
+
+        pending = set(self._deferred_temp_deletes)
+        self._deferred_temp_deletes.clear()
+        for temp_output in pending:
+            deleted = await self._delete_temp(temp_output, attempts=20, retry_delay=0.5, defer=False)
+            if not deleted:
+                self._deferred_temp_deletes.add(temp_output)
 
     def _delete_temp_outputs(self, temp_output: Path) -> None:
         for path in self._temp_output_cleanup_candidates(temp_output):
