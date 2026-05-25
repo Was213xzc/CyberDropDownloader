@@ -95,6 +95,8 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert options.video_profile == "hevc_balanced"
         assert options.video_backend == "pynv"
         assert options.ffmpeg_nvenc_fallback is False
+        assert options.handbrake_cli_path is None
+        assert options.handbrake_encoder is None
         assert options.video_codec == "hevc"
         assert options.video_workers_per_gpu == 2
         assert options.hevc_cq == 23
@@ -110,7 +112,7 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert CompressionOptions.model_validate({"video_workers_per_gpu": 0}).video_workers_per_gpu == 1
         assert CompressionOptions.model_validate({"video_profile": "AV1_SAVINGS"}).video_profile == "av1_savings"
         assert CompressionOptions.model_validate({"video_codec": "AV1"}).video_codec == "av1"
-        assert CompressionOptions.model_validate({"video_backend": "handbrake"}).video_backend == "pynv"
+        assert CompressionOptions.model_validate({"video_backend": "handbrake"}).video_backend == "handbrake"
         assert CompressionOptions().effective_video_profile() == "hevc_balanced"
         assert CompressionOptions(video_profile="custom").effective_video_profile() == "custom"
         assert CompressionOptions(preset="P4").effective_video_profile() == "custom"
@@ -121,6 +123,8 @@ def test_compression_options_defaults_validation_and_yaml_serialization() -> Non
         assert serialized_config["compression_options"]["video_codec"] == "hevc"
         assert serialized_config["compression_options"]["video_workers_per_gpu"] == 2
         assert serialized_config["compression_options"]["ffmpeg_nvenc_fallback"] is False
+        assert serialized_config["compression_options"]["handbrake_cli_path"] is None
+        assert serialized_config["compression_options"]["handbrake_encoder"] is None
         assert serialized_config["compression_options"]["image_min_savings_percent"] == 0
         assert serialized_config["compression_options"]["video_cq_retry_step"] == 4
         assert serialized_config["compression_options"]["video_cq_max"] == 35
@@ -145,6 +149,67 @@ def test_video_compression_skips_when_pynv_is_unavailable() -> None:
         assert result.error == "PyNvVideoCodec is not installed"
         assert owner.progress_manager.results == [("skipped", 0)]
         assert owner.log_manager.rows[0]["status"] == "skipped"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_video_compression_skips_when_handbrake_is_unavailable() -> None:
+    root = _reset_test_dir()
+    try:
+        video = root / "video.mp4"
+        video.write_bytes(b"not a real video, but HandBrake is checked before transcoding")
+        owner = FakeCompressionOwner(CompressionOptions(video_backend="handbrake"))
+        compression_manager = CompressionManager(cast("Any", owner))
+        compression_manager._resolve_handbrake_cli = lambda: None  # type: ignore[method-assign]
+
+        result = asyncio.run(compression_manager.compress_media_item(_media_item(video)))
+
+        assert result is not None
+        assert result.status == "skipped"
+        assert result.backend == "handbrake"
+        assert result.error == "HandBrakeCLI is not installed or could not be found"
+        assert owner.progress_manager.results == [("skipped", 0)]
+        assert owner.log_manager.rows[0]["backend"] == "handbrake"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_handbrake_backend_builds_command_and_promotes_mp4_output() -> None:
+    root = _reset_test_dir()
+    try:
+        video = root / "clip.mov"
+        video.write_bytes(b"x" * 100)
+        owner = FakeCompressionOwner(CompressionOptions(video_backend="handbrake", min_savings_percent=1))
+        compression_manager = CompressionManager(cast("Any", owner))
+        compression_manager._resolve_handbrake_cli = lambda: Path("C:/Program Files/HandBrake/HandBrakeCLI.exe")  # type: ignore[method-assign]
+        commands: list[list[str]] = []
+
+        async def run_handbrake(command: list[str]) -> None:
+            commands.append(command)
+            output = Path(command[command.index("-o") + 1])
+            await asyncio.to_thread(output.write_bytes, b"y" * 50)
+
+        compression_manager._run_handbrake_command = run_handbrake  # type: ignore[method-assign]
+
+        result = asyncio.run(compression_manager.compress_media_item(_media_item(video)))
+
+        resolved_video = video.resolve()
+        promoted = resolved_video.with_name("[COMPRESSED] clip.mp4")
+        assert result is not None
+        assert result.status == "compressed"
+        assert result.backend == "handbrake"
+        assert result.path == promoted
+        assert promoted.read_bytes() == b"y" * 50
+        assert not video.exists()
+        command = commands[0]
+        assert command[command.index("-i") + 1] == str(resolved_video)
+        assert command[command.index("-o") + 1] == str(resolved_video.with_name("clip.compressed.mp4"))
+        assert command[command.index("--format") + 1] == "av_mp4"
+        assert command[command.index("-e") + 1] == "nvenc_h265"
+        assert command[command.index("-q") + 1] == "23"
+        assert command[command.index("--encoder-preset") + 1] == "medium"
+        assert "--all-audio" in command
+        assert owner.log_manager.rows[0]["backend"] == "handbrake"
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

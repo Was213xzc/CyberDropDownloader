@@ -5,6 +5,7 @@ import contextlib
 import gc
 import importlib
 import json
+import shutil
 import subprocess
 import sys
 from collections import deque
@@ -30,6 +31,22 @@ MediaType = Literal["video", "image"]
 VideoProfile = Literal["hevc_balanced", "av1_savings", "custom"]
 
 _COMPRESSED_MARKER = "[COMPRESSED] "
+_HANDBRAKE_AUDIO_COPY_MASK = "aac,ac3,eac3,truehd,dts,dtshd,mp2,mp3,opus,vorbis,flac,alac"
+_HANDBRAKE_COMMON_PATHS = (
+    Path(r"C:\Program Files\HandBrake\HandBrakeCLI.exe"),
+    Path(r"C:\Program Files (x86)\HandBrake\HandBrakeCLI.exe"),
+    Path(r"C:\Program Files\HandBrake Nightly\HandBrakeCLI.exe"),
+)
+_HANDBRAKE_NVENC_PRESETS = {
+    "P1": "fastest",
+    "P2": "faster",
+    "P3": "fast",
+    "P4": "medium",
+    "P5": "slow",
+    "P6": "slower",
+    "P7": "slowest",
+}
+_HANDBRAKE_NATIVE_PRESETS = {"fastest", "faster", "fast", "medium", "slow", "slower", "slowest"}
 
 
 @dataclass(slots=True, kw_only=True)
@@ -819,6 +836,11 @@ class CompressionManager:
         return result
 
     async def _compress_video(self, media_item: MediaItem, source: Path) -> CompressionResult:
+        if self.options.video_backend == "handbrake":
+            return await self._compress_video_with_handbrake(media_item, source)
+        return await self._compress_video_with_pynv(media_item, source)
+
+    async def _compress_video_with_pynv(self, media_item: MediaItem, source: Path) -> CompressionResult:
         gpu_id = self._next_gpu_id()
         pynv = await self._ensure_video_runtime()
         if pynv is None:
@@ -891,6 +913,68 @@ class CompressionManager:
         return CompressionResult(
             status="skipped",
             error=_summarize_retry_errors("PyNvVideoCodec could not create a small enough output", errors),
+            **(result_kwargs | {"cq": cq_attempts[-1], "bf": settings.bf}),
+        )
+
+    async def _compress_video_with_handbrake(self, media_item: MediaItem, source: Path) -> CompressionResult:
+        del media_item
+        gpu_id = self._next_gpu_id()
+        handbrake = self._resolve_handbrake_cli()
+        settings = self._effective_video_settings(gpu_id)
+        self._log_effective_video_settings(gpu_id, settings)
+        encoder = self._handbrake_encoder(settings)
+        result_kwargs = {
+            "media_type": "video",
+            "backend": "handbrake",
+            "path": source,
+            "gpu_id": gpu_id,
+            "codec": settings.codec,
+            "cq": settings.cq,
+            "bf": settings.bf,
+        }
+
+        if handbrake is None:
+            return CompressionResult(
+                status="skipped",
+                error="HandBrakeCLI is not installed or could not be found",
+                **result_kwargs,
+            )
+
+        temp_output_template = self._handbrake_temp_output_template(source)
+        errors: list[str] = []
+        cq_attempts = self._video_cq_attempts(settings.codec)
+        for attempt_cq in cq_attempts:
+            attempt_settings = replace(settings, cq=attempt_cq)
+            attempt_kwargs = result_kwargs | {"cq": attempt_cq, "bf": attempt_settings.bf}
+            temp_output = temp_output_template
+            if not await self._delete_temp(temp_output):
+                return CompressionResult(
+                    status="skipped",
+                    error="Temporary compression output is locked",
+                    **attempt_kwargs,
+                )
+
+            try:
+                async with self._video_slot(gpu_id):
+                    await self._transcode_with_handbrake(handbrake, source, temp_output, gpu_id, attempt_settings)
+            except Exception as e:
+                await self._delete_temp(temp_output)
+                error = _format_handbrake_exception(e)
+                errors.append(f"CQ {attempt_cq}: {error}")
+                if self._should_retry_with_higher_cq(error, attempt_cq):
+                    continue
+                return CompressionResult(status="skipped", error=error, **attempt_kwargs)
+
+            result = await self._finalize_output(source, temp_output, "video", **attempt_kwargs)
+            if result.status == "compressed":
+                return result
+            errors.append(f"CQ {attempt_cq}: {result.error}")
+            if not self._should_retry_with_higher_cq(result.error, attempt_cq):
+                return result
+
+        return CompressionResult(
+            status="skipped",
+            error=_summarize_retry_errors("HandBrakeCLI could not create a small enough output", errors),
             **(result_kwargs | {"cq": cq_attempts[-1], "bf": settings.bf}),
         )
 
@@ -989,6 +1073,123 @@ class CompressionManager:
 
         with Image.open(path) as image:
             image.verify()
+
+    def _resolve_handbrake_cli(self) -> Path | None:
+        configured = self.options.handbrake_cli_path
+        if configured:
+            configured_path = Path(configured).expanduser()
+            if configured_path.is_file():
+                return configured_path
+            found_configured = shutil.which(configured)
+            if found_configured:
+                return Path(found_configured)
+
+        for executable in ("HandBrakeCLI", "HandBrakeCLI.exe"):
+            found = shutil.which(executable)
+            if found:
+                return Path(found)
+
+        return next((path for path in _HANDBRAKE_COMMON_PATHS if path.is_file()), None)
+
+    def _handbrake_temp_output_template(self, source: Path) -> Path:
+        suffix = source.suffix.lower()
+        output_suffix = source.suffix if suffix in {".mp4", ".m4v", ".mkv"} else ".mp4"
+        return source.with_name(f"{source.stem}.compressed{output_suffix}")
+
+    async def _transcode_with_handbrake(
+        self,
+        executable: Path,
+        source: Path,
+        temp_output: Path,
+        gpu_id: int,
+        settings: EffectiveVideoSettings,
+    ) -> None:
+        command = self._handbrake_command(executable, source, temp_output, gpu_id, settings)
+        await self._run_handbrake_command(command)
+
+    async def _run_handbrake_command(self, command: list[str]) -> None:
+        kwargs = {
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        process = await asyncio.create_subprocess_exec(*command, **kwargs)
+        stdout, stderr = await process.communicate()
+        if process.returncode == 0:
+            return
+
+        output = "\n".join(
+            part.decode("utf-8", errors="replace").strip()
+            for part in (stderr, stdout)
+            if part
+        )
+        raise RuntimeError(_format_handbrake_failure(process.returncode or 1, output))
+
+    def _handbrake_command(
+        self,
+        executable: Path,
+        source: Path,
+        temp_output: Path,
+        gpu_id: int,
+        settings: EffectiveVideoSettings,
+    ) -> list[str]:
+        encoder = self._handbrake_encoder(settings)
+        command = [
+            str(executable),
+            "-i",
+            str(source),
+            "-o",
+            str(temp_output),
+            "--format",
+            self._handbrake_container_format(temp_output),
+            "-e",
+            encoder,
+            "-q",
+            str(settings.cq),
+            "--all-audio",
+            "-E",
+            "copy",
+            "--audio-copy-mask",
+            _HANDBRAKE_AUDIO_COPY_MASK,
+            "--audio-fallback",
+            "av_aac",
+            "--keep-metadata",
+        ]
+        if temp_output.suffix.casefold() in {".mp4", ".m4v"}:
+            command.append("--optimize")
+
+        preset = self._handbrake_encoder_preset(encoder, settings)
+        if preset:
+            command.extend(["--encoder-preset", preset])
+
+        del gpu_id
+        return command
+
+    def _handbrake_encoder(self, settings: EffectiveVideoSettings) -> str:
+        if self.options.handbrake_encoder:
+            return self.options.handbrake_encoder
+        if settings.codec == "av1":
+            return "nvenc_av1"
+        return "nvenc_h265"
+
+    def _handbrake_encoder_preset(self, encoder: str, settings: EffectiveVideoSettings) -> str | None:
+        if not encoder.startswith("nvenc_"):
+            return None
+
+        preset = settings.preset.casefold()
+        if preset in _HANDBRAKE_NATIVE_PRESETS:
+            return preset
+        return _HANDBRAKE_NVENC_PRESETS.get(settings.preset.upper())
+
+    def _handbrake_container_format(self, temp_output: Path) -> str:
+        suffix = temp_output.suffix.casefold()
+        if suffix == ".mkv":
+            return "av_mkv"
+        if suffix == ".webm":
+            return "av_webm"
+        return "av_mp4"
 
     async def _transcode_with_pynv_subprocess(
         self,
@@ -1186,6 +1387,8 @@ class CompressionManager:
     def _start_video_runtime_if_needed(self) -> None:
         if not self.options.enabled or not self.options.compress_videos:
             return
+        if self.options.video_backend != "pynv":
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -1337,6 +1540,17 @@ class CompressionManager:
         return max(1, min(configured_workers, encoder_engines))
 
     def _capabilities_for(self, gpu_id: int, codec: str) -> VideoCodecCapabilities:
+        if self.options.video_backend == "handbrake":
+            return VideoCodecCapabilities(
+                codec=codec,
+                supported=True,
+                num_encoder_engines=max(int(self.options.video_workers_per_gpu), 1),
+                num_max_bframes=max(int(self.options.bf), 0),
+                support_lookahead=True,
+                support_temporal_aq=True,
+                support_10bit_encode=True,
+            )
+
         capabilities = self._codec_capabilities.get(gpu_id, {})
         if codec in capabilities:
             return capabilities[codec]
@@ -1470,9 +1684,10 @@ class CompressionManager:
         return candidate
 
     async def _promote_video_output(self, temp_output: Path, source: Path) -> Path:
-        candidate = source.with_name(_COMPRESSED_MARKER + source.name)
+        target_suffix = temp_output.suffix if temp_output.suffix != source.suffix else source.suffix
+        candidate = source.with_name(f"{_COMPRESSED_MARKER}{source.stem}{target_suffix}")
         if await asyncio.to_thread(candidate.exists):
-            candidate = await asyncio.to_thread(self._next_available_marked_name, source)
+            candidate = await asyncio.to_thread(self._next_available_marked_name, source, target_suffix)
             if candidate is None:
                 raise OSError(f"Unable to find a free [COMPRESSED] filename for {source}")
 
@@ -1480,8 +1695,8 @@ class CompressionManager:
         await self._delete_original_after_promotion(source, candidate)
         return candidate
 
-    def _next_available_marked_name(self, source: Path) -> Path | None:
-        stem, suffix = source.stem, source.suffix
+    def _next_available_marked_name(self, source: Path, suffix: str | None = None) -> Path | None:
+        stem, suffix = source.stem, suffix or source.suffix
         for counter in range(1, 1000):
             candidate = source.with_name(f"{_COMPRESSED_MARKER}{stem} ({counter}){suffix}")
             if not candidate.exists():
@@ -1644,6 +1859,23 @@ def _format_pynv_worker_failure(returncode: int, output: str) -> str:
     if sys.platform == "win32":
         return f"PyNvVideoCodec worker failed with exit code {returncode} (0x{returncode & 0xFFFFFFFF:08X})"
     return f"PyNvVideoCodec worker failed with exit code {returncode}"
+
+
+def _format_handbrake_exception(error: Exception) -> str:
+    message = str(error).strip()
+    return message or error.__class__.__name__
+
+
+def _format_handbrake_failure(returncode: int, output: str) -> str:
+    summary = _tail_process_output(output)
+    if summary:
+        return f"HandBrakeCLI failed with exit code {returncode}: {summary}"
+    return f"HandBrakeCLI failed with exit code {returncode}"
+
+
+def _tail_process_output(output: str, *, max_lines: int = 12) -> str:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return "\n".join(lines[-max_lines:])
 
 
 def _summarize_retry_errors(prefix: str, errors: list[str], *, max_errors: int = 3) -> str:

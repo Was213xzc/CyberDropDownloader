@@ -297,6 +297,8 @@ class CompressionOptions(BaseModel):
     video_profile: NonEmptyStr = "hevc_balanced"
     video_backend: NonEmptyStr = "pynv"
     ffmpeg_nvenc_fallback: bool = False
+    handbrake_cli_path: NonEmptyStrOrNone = None
+    handbrake_encoder: NonEmptyStrOrNone = None
     video_codec: NonEmptyStr = "hevc"
     gpu_ids: list[NonNegativeInt] = [0]
     video_workers_per_gpu: PositiveInt = 2
@@ -319,10 +321,8 @@ class CompressionOptions(BaseModel):
     @classmethod
     def validate_video_backend(cls, value: str) -> str:
         backend = value.casefold()
-        if backend == "handbrake":
-            return "pynv"
-        if backend != "pynv":
-            raise ValueError("only 'pynv' is supported")
+        if backend not in {"pynv", "handbrake"}:
+            raise ValueError("video_backend must be 'pynv' or 'handbrake'")
         return backend
 
     @field_validator("video_profile", mode="after")
