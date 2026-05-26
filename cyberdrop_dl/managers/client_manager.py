@@ -386,9 +386,10 @@ class ClientManager:
         content_length, content_type = headers.get("Content-Length"), headers.get("Content-Type")
         if content_length is None or content_type is None:
             return
-        if content_length == "322509" and content_type == "video/mp4":
+        normalized_content_type = str(content_type).split(";", maxsplit=1)[0].strip().lower()
+        if content_length == "322509" and normalized_content_type == "video/mp4":
             raise DownloadError(status="Bunkr Maintenance", message="Bunkr under maintenance")
-        if content_length == "73003" and content_type == "video/mp4":
+        if content_length == "73003" and normalized_content_type == "video/mp4":
             raise DownloadError(410)  # Placeholder video with text "Video removed" (efukt)
 
     async def check_file_duration(self, media_item: MediaItem) -> bool:

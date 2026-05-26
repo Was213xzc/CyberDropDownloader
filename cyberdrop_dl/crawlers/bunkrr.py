@@ -39,7 +39,7 @@ class Selector:
 
 VIDEO_AND_IMAGE_EXTS: set[str] = FILE_FORMATS["Images"] | FILE_FORMATS["Videos"]
 HOST_OPTIONS: set[str] = {"bunkr.site", "bunkr.cr", "bunkr.ph"}
-DEEP_SCRAPE_CDNS: set[str] = {"burger", "milkshake"}  # CDNs under maintanance, ignore them and try to get a cached URL
+DEEP_SCRAPE_CDNS: set[str] = {"burger", "milkshake", "rice"}  # CDNs under maintenance, resolve via file page/API.
 ALBUM_PAGE_CONCURRENCY = 5
 known_bad_hosts: set[str] = set()
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -456,6 +456,9 @@ class BunkrrCrawler(Crawler):
             self.create_task(self.run(scrape_item))
             return
 
+        if _should_resolve_album_source_via_api(src):
+            src = await self._request_download(file.slug)
+
         if self.check_album_results(src, results):
             return
 
@@ -466,7 +469,7 @@ class BunkrrCrawler(Crawler):
             src.suffix.lower() not in VIDEO_AND_IMAGE_EXTS
             or "no-image" in src.name
             or self.deep_scrape
-            or any(cdn in src.host for cdn in DEEP_SCRAPE_CDNS)
+            or _should_resolve_album_source_via_api(src)
         )
         if deep_scrape:
             self.create_task(self.run(scrape_item))
@@ -594,6 +597,10 @@ def _is_stream_redirect(url: AbsoluteHttpURL) -> bool:
     if not prefix and number.isdigit():
         return True
     return any(part in url.host for part in ("cdn12", "cdn-")) or url.host == "cdn.bunkr.ru"
+
+
+def _should_resolve_album_source_via_api(url: AbsoluteHttpURL) -> bool:
+    return any(cdn in url.host for cdn in DEEP_SCRAPE_CDNS)
 
 
 def _override_cdn(url: AbsoluteHttpURL) -> AbsoluteHttpURL:

@@ -337,6 +337,36 @@ async def test_album_file_uses_album_results_before_referer_lookup() -> None:
     crawler.create_task.assert_not_called()
 
 
+async def test_album_file_resolves_rice_cdn_shortcuts_via_api() -> None:
+    manager = mock.Mock()
+    manager.config_manager.deep_scrape = False
+    manager.states.RUNNING.wait = mock.AsyncMock()
+    manager.progress_manager.scraping_progress.add_task.return_value = 1
+    crawler = BunkrrCrawler(manager)
+    file = File(
+        name="vid.mp4",
+        thumbnail="https://i-rice.bunkr.ru/thumbs/3bfe9040-7c3b-4b50-b077-f7d5414ba300.png",
+        date="12:00:00 01/01/2024",
+        slug="4CIsnW3JB3MUm",
+    )
+
+    crawler.check_complete_from_referer = mock.AsyncMock(return_value=False)
+    crawler._request_download = mock.AsyncMock(return_value=AbsoluteHttpURL("https://c2ri.scdn.st/file.mp4"))
+    crawler._direct_file = mock.AsyncMock()
+    crawler.create_task = mock.Mock()
+    crawler.run = mock.Mock(return_value="run-task")
+
+    await crawler._album_file(ScrapeItem(url=AbsoluteHttpURL("https://bunkr.cr/f/4CIsnW3JB3MUm")), file, {})
+
+    crawler._request_download.assert_awaited_once_with("4CIsnW3JB3MUm")
+    crawler._direct_file.assert_awaited_once()
+    direct_scrape_item, direct_url, direct_name = crawler._direct_file.await_args.args
+    assert direct_scrape_item.url == AbsoluteHttpURL("https://bunkr.cr/f/4CIsnW3JB3MUm")
+    assert direct_url == AbsoluteHttpURL("https://c2ri.scdn.st/file.mp4")
+    assert direct_name == "vid.mp4"
+    crawler.create_task.assert_not_called()
+
+
 async def test_top_level_file_does_not_expand_related_album() -> None:
     crawler = BunkrrCrawler(mock.Mock())
     file_url = AbsoluteHttpURL("https://bunkr.cr/f/8-16-8out556m95_30UUdVDDAQ-HnEfe1zW.mp4")

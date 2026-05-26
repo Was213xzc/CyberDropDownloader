@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import itertools
 import time
 from collections.abc import Generator
 from http import HTTPStatus
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import aiofiles
@@ -23,7 +25,6 @@ from cyberdrop_dl.utils.utilities import get_size_or_none
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Coroutine, Generator, Mapping
-    from pathlib import Path
     from typing import Any
 
     from cyberdrop_dl.data_structures.url_objects import MediaItem
@@ -39,10 +40,31 @@ _CHROME_ANDROID_USER_AGENT: str = (
 _FREE_SPACE_CHECK_PERIOD: int = 5  # Check every 5 chunks
 _NULL_CONTEXT: contextlib.nullcontext[None] = contextlib.nullcontext()
 _USE_IMPERSONATION: set[str] = {"vsco", "celebforum", "coomer"}
+_KNOWN_BAD_DOWNLOAD_SIGNATURES: dict[int, dict[str, int | str]] = {
+    # Bunkr sometimes serves its maintenance placeholder from otherwise valid-looking CDN file URLs.
+    322_509: {
+        "d503b7265dc8331c058e7e2fe17a2389f41266d181ca5218e189bdaf4784c113": "Bunkr Maintenance",
+    },
+}
 
 
 class _RetryWithoutRange(Exception):
     """Signals a 416 on a resumed request — the stale .part has been deleted; retry from byte 0."""
+
+
+def _known_bad_download_status(path: Path) -> int | str | None:
+    try:
+        known_hashes = _KNOWN_BAD_DOWNLOAD_SIGNATURES.get(path.stat().st_size)
+    except OSError:
+        return None
+    if not known_hashes:
+        return None
+
+    file_hash = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            file_hash.update(chunk)
+    return known_hashes.get(file_hash.hexdigest())
 
 
 class DownloadClient:
@@ -311,6 +333,9 @@ class DownloadClient:
         if not await aio.get_size(media_item.partial_file):
             await aio.unlink(media_item.partial_file, missing_ok=True)
             raise DownloadError(HTTPStatus.INTERNAL_SERVER_ERROR, message="File is empty")
+        if status := await asyncio.to_thread(_known_bad_download_status, media_item.partial_file):
+            await aio.unlink(media_item.partial_file, missing_ok=True)
+            raise DownloadError(status, message="Known bad download placeholder")
 
     def make_free_space_checker(self, media_item: MediaItem) -> Callable[[], Coroutine[Any, Any, None]]:
         current_chunk = 0

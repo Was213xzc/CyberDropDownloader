@@ -1,4 +1,6 @@
+import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -8,6 +10,8 @@ from cyberdrop_dl.crawlers.coomer import _coomer_download_fallbacks
 from cyberdrop_dl.data_structures import MediaItem
 from cyberdrop_dl.data_structures.url_objects import AbsoluteHttpURL
 from cyberdrop_dl.downloader.downloader import Downloader
+from cyberdrop_dl.exceptions import DownloadError
+from cyberdrop_dl.managers.client_manager import ClientManager
 
 
 def _item(fallbacks_: object) -> MediaItem:
@@ -67,6 +71,44 @@ def test_connection_error_fallback_does_not_use_callable_without_response() -> N
     item = _item(_fallback_gen)
     gen = download_client._fallback_generator(item)
     assert download_client._next_fallback_url_for_connection_error(gen) is None
+
+
+def test_known_bad_download_signature_matches_hash(tmp_path, monkeypatch) -> None:
+    data = b"bunkr maintenance placeholder"
+    placeholder = tmp_path / "maintenance.mp4.part"
+    placeholder.write_bytes(data)
+    signature = hashlib.sha256(data).hexdigest()
+    monkeypatch.setattr(
+        download_client,
+        "_KNOWN_BAD_DOWNLOAD_SIGNATURES",
+        {len(data): {signature: "Bunkr Maintenance"}},
+    )
+
+    assert download_client._known_bad_download_status(placeholder) == "Bunkr Maintenance"
+
+
+@pytest.mark.asyncio
+async def test_post_download_check_deletes_known_bad_placeholder(tmp_path, monkeypatch) -> None:
+    placeholder = tmp_path / "maintenance.mp4.part"
+    placeholder.write_bytes(b"not empty")
+    monkeypatch.setattr(download_client, "_known_bad_download_status", lambda path: "Bunkr Maintenance")
+    client = download_client.DownloadClient.__new__(download_client.DownloadClient)
+    media_item = cast(MediaItem, SimpleNamespace(partial_file=placeholder))
+
+    with pytest.raises(DownloadError) as exc_info:
+        await client._post_download_check(media_item)
+
+    assert exc_info.value.ui_failure == "Bunkr Maintenance"
+    assert not placeholder.exists()
+
+
+def test_content_length_check_accepts_content_type_parameters() -> None:
+    headers = {"Content-Length": "322509", "Content-Type": "video/mp4; charset=utf-8"}
+
+    with pytest.raises(DownloadError) as exc_info:
+        ClientManager.check_content_length(headers)
+
+    assert exc_info.value.ui_failure == "Bunkr Maintenance"
 
 
 def test_coomer_download_fallbacks_include_origin_and_all_cdns() -> None:
