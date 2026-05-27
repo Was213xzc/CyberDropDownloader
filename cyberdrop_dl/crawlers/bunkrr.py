@@ -39,7 +39,7 @@ class Selector:
 
 VIDEO_AND_IMAGE_EXTS: set[str] = FILE_FORMATS["Images"] | FILE_FORMATS["Videos"]
 HOST_OPTIONS: set[str] = {"bunkr.site", "bunkr.cr", "bunkr.ph"}
-DEEP_SCRAPE_CDNS: set[str] = {"burger", "milkshake", "rice"}  # CDNs under maintenance, resolve via file page/API.
+DEEP_SCRAPE_CDNS: set[str] = {"burger", "milkshake", "rice"}  # CDNs under maintenance, resolve via API.
 ALBUM_PAGE_CONCURRENCY = 5
 known_bad_hosts: set[str] = set()
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
@@ -448,28 +448,27 @@ class BunkrrCrawler(Crawler):
     async def _album_file(self, scrape_item: ScrapeItem, file: File, results: dict[str, int]) -> None:
         db_url = scrape_item.url.with_host(self.DATABASE_PRIMARY_HOST)
         scrape_item.possible_datetime = self.parse_date(file.date, "%H:%M:%S %d/%m/%Y")
+        src = None
         try:
             src = file.src()
         except ValueError:
-            if await self.check_complete_from_referer(db_url):
-                return
-            self.create_task(self.run(scrape_item))
-            return
+            pass
 
-        if _should_resolve_album_source_via_api(src):
-            src = await self._request_download(file.slug)
-
-        if self.check_album_results(src, results):
+        if src and self.check_album_results(src, results):
             return
 
         if await self.check_complete_from_referer(db_url):
             return
 
+        if src is None or _should_resolve_album_source_via_api(src):
+            src = await self._request_download(file.slug)
+            if self.check_album_results(src, results):
+                return
+
         deep_scrape = (
             src.suffix.lower() not in VIDEO_AND_IMAGE_EXTS
             or "no-image" in src.name
             or self.deep_scrape
-            or _should_resolve_album_source_via_api(src)
         )
         if deep_scrape:
             self.create_task(self.run(scrape_item))
@@ -600,7 +599,7 @@ def _is_stream_redirect(url: AbsoluteHttpURL) -> bool:
 
 
 def _should_resolve_album_source_via_api(url: AbsoluteHttpURL) -> bool:
-    return any(cdn in url.host for cdn in DEEP_SCRAPE_CDNS)
+    return url.host.endswith(".bunkr.ru") or any(cdn in url.host for cdn in DEEP_SCRAPE_CDNS)
 
 
 def _override_cdn(url: AbsoluteHttpURL) -> AbsoluteHttpURL:

@@ -328,11 +328,13 @@ async def test_album_file_uses_album_results_before_referer_lookup() -> None:
 
     crawler.check_complete_from_referer = mock.AsyncMock(return_value=False)
     crawler._direct_file = mock.AsyncMock()
+    crawler._request_download = mock.AsyncMock()
     crawler.create_task = mock.Mock()
 
     await crawler._album_file(ScrapeItem(url=AbsoluteHttpURL("https://bunkr.cr/f/one.mp4")), file, results)
 
     crawler.check_complete_from_referer.assert_not_awaited()
+    crawler._request_download.assert_not_awaited()
     crawler._direct_file.assert_not_awaited()
     crawler.create_task.assert_not_called()
 
@@ -364,6 +366,31 @@ async def test_album_file_resolves_rice_cdn_shortcuts_via_api() -> None:
     assert direct_scrape_item.url == AbsoluteHttpURL("https://bunkr.cr/f/4CIsnW3JB3MUm")
     assert direct_url == AbsoluteHttpURL("https://c2ri.scdn.st/file.mp4")
     assert direct_name == "vid.mp4"
+    crawler.create_task.assert_not_called()
+
+
+async def test_album_file_uses_api_when_thumbnail_source_is_unusable() -> None:
+    manager = mock.Mock()
+    manager.config_manager.deep_scrape = False
+    manager.states.RUNNING.wait = mock.AsyncMock()
+    manager.progress_manager.scraping_progress.add_task.return_value = 1
+    crawler = BunkrrCrawler(manager)
+    file = File(
+        name="vid.mp4",
+        thumbnail="https://static.scdn.st/no-thumb.png",
+        date="12:00:00 01/01/2024",
+        slug="fallback-slug",
+    )
+
+    crawler.check_complete_from_referer = mock.AsyncMock(return_value=False)
+    crawler._request_download = mock.AsyncMock(return_value=AbsoluteHttpURL("https://c2ri.scdn.st/file.mp4"))
+    crawler._direct_file = mock.AsyncMock()
+    crawler.create_task = mock.Mock()
+
+    await crawler._album_file(ScrapeItem(url=AbsoluteHttpURL("https://bunkr.cr/f/fallback-slug")), file, {})
+
+    crawler._request_download.assert_awaited_once_with("fallback-slug")
+    crawler._direct_file.assert_awaited_once()
     crawler.create_task.assert_not_called()
 
 
