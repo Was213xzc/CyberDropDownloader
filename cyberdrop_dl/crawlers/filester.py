@@ -73,8 +73,11 @@ class FilesterCrawler(Crawler):
             return
 
         soup = await self.request_soup(scrape_item.url)
-        checksum = css.select_text(soup, Selector.SHA_256)
-        if await self.check_complete_by_hash(scrape_item, "sha256", checksum):
+        try:
+            checksum = css.select_text(soup, Selector.SHA_256)
+        except css.SelectorError:
+            checksum = None
+        if checksum and await self.check_complete_by_hash(scrape_item, "sha256", checksum):
             return
 
         dl_link = await self._request_download(slug)
