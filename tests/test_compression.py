@@ -84,6 +84,14 @@ def _media_item(path: Path, url: str = "https://example.com/media") -> MediaItem
     )
 
 
+def _large_payload_with_sparse_differences() -> tuple[bytes, bytes]:
+    first = bytearray(b"a" * (1024 * 1024 + 4096))
+    second = bytearray(first)
+    for index in range(20):
+        second[50 + index * 97] = ord("b")
+    return bytes(first), bytes(second)
+
+
 def test_compression_options_defaults_validation_and_yaml_serialization() -> None:
     root = _reset_test_dir()
     config_file = root / "config.yaml"
@@ -983,6 +991,84 @@ def test_compressed_marker_picks_counter_suffix_on_collision() -> None:
         assert new_path.name == "[COMPRESSED] clip (1).mp4"
         assert new_path.exists()
         assert collision.exists()
+        assert not source.exists()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_compressed_marker_reuses_existing_duplicate_marker() -> None:
+    root = _reset_test_dir()
+    try:
+        source = root / "clip.mp4"
+        source.write_bytes(b"same")
+        collision = root / "[COMPRESSED] clip.mp4"
+        collision.write_bytes(b"same")
+        manager = CompressionManager(cast("Any", FakeCompressionOwner()))
+        media_item = cast(
+            "MediaItem",
+            SimpleNamespace(
+                complete_file=source,
+                filename=source.name,
+                download_filename=source.name,
+                db_path="x",
+                is_segment=False,
+                url="https://example.com/media",
+                filesize=4,
+            ),
+        )
+
+        new_path = asyncio.run(manager._apply_compressed_marker(media_item, source))
+        assert new_path == collision
+        assert collision.read_bytes() == b"same"
+        assert not source.exists()
+        assert not (root / "[COMPRESSED] clip (1).mp4").exists()
+        assert media_item.complete_file == collision
+        assert media_item.download_filename == collision.name
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_promote_video_output_reuses_existing_duplicate_target() -> None:
+    root = _reset_test_dir()
+    try:
+        source = root / "clip.mp4"
+        temp_output = root / "clip.compressed.mp4"
+        target = root / "[COMPRESSED] clip.mp4"
+        existing_payload, incoming_payload = _large_payload_with_sparse_differences()
+        source.write_bytes(b"x" * (len(incoming_payload) * 2))
+        target.write_bytes(existing_payload)
+        temp_output.write_bytes(incoming_payload)
+        manager = CompressionManager(cast("Any", FakeCompressionOwner()))
+
+        promoted = asyncio.run(manager._promote_video_output(temp_output, source))
+
+        assert promoted == target
+        assert target.read_bytes() == existing_payload
+        assert not temp_output.exists()
+        assert not source.exists()
+        assert not (root / "[COMPRESSED] clip (1).mp4").exists()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_promote_video_output_uses_counter_for_different_existing_target() -> None:
+    root = _reset_test_dir()
+    try:
+        source = root / "clip.mp4"
+        temp_output = root / "clip.compressed.mp4"
+        target = root / "[COMPRESSED] clip.mp4"
+        source.write_bytes(b"x" * 100)
+        target.write_bytes(b"a" * (1024 * 1024 + 4096))
+        temp_output.write_bytes(b"b" * (1024 * 1024 + 4096))
+        manager = CompressionManager(cast("Any", FakeCompressionOwner()))
+
+        promoted = asyncio.run(manager._promote_video_output(temp_output, source))
+        counter_target = root / "[COMPRESSED] clip (1).mp4"
+
+        assert promoted == counter_target
+        assert target.read_bytes() == b"a" * (1024 * 1024 + 4096)
+        assert counter_target.read_bytes() == b"b" * (1024 * 1024 + 4096)
+        assert not temp_output.exists()
         assert not source.exists()
     finally:
         shutil.rmtree(root, ignore_errors=True)

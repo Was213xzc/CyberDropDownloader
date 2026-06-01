@@ -31,6 +31,9 @@ MediaType = Literal["video", "image"]
 VideoProfile = Literal["hevc_balanced", "av1_savings", "custom"]
 
 _COMPRESSED_MARKER = "[COMPRESSED] "
+_DUPLICATE_OUTPUT_MIN_FUZZY_SIZE = 1_000_000
+_DUPLICATE_OUTPUT_MAX_DIFFERING_BYTES = 4096
+_DUPLICATE_OUTPUT_MAX_DIFFERENCE_RATIO = 0.0001
 _HANDBRAKE_AUDIO_COPY_MASK = "aac,ac3,eac3,truehd,dts,dtshd,mp2,mp3,opus,vorbis,flac,alac"
 _HANDBRAKE_COMMON_PATHS = (
     Path(r"C:\Program Files\HandBrake\HandBrakeCLI.exe"),
@@ -791,7 +794,9 @@ class CompressionManager:
                 return False
             source_size = source.stat().st_size
             marked_size = marked.stat().st_size
-            return 0 < marked_size < source_size
+            if 0 < marked_size < source_size:
+                return True
+            return marked_size == source_size and self._files_match_existing_compressed_output(marked, source)
 
         if not await asyncio.to_thread(source_and_marked_are_files):
             return None
@@ -1668,6 +1673,22 @@ class CompressionManager:
 
         candidate = source.with_name(_COMPRESSED_MARKER + source.name)
         if await asyncio.to_thread(candidate.exists):
+            if await asyncio.to_thread(self._files_match_existing_compressed_output, candidate, source):
+                log(
+                    f"Found existing compressed file {candidate.name}; removing duplicate source {source.name}",
+                    20,
+                )
+                deleted = await self._try_unlink_source(
+                    source,
+                    locked_context=f"Using existing compressed file {candidate}, but duplicate source is still locked",
+                    error_context=f"Using existing compressed file {candidate}, but duplicate source could not be removed",
+                )
+                if not deleted:
+                    self._deferred_original_deletes[source] = candidate
+                media_item.complete_file = candidate
+                media_item.download_filename = candidate.name
+                return candidate
+
             candidate = await asyncio.to_thread(self._next_available_marked_name, source)
             if candidate is None:
                 log(f"Unable to apply [COMPRESSED] marker to {source}: no free filename", 30)
@@ -1687,6 +1708,15 @@ class CompressionManager:
         target_suffix = temp_output.suffix if temp_output.suffix != source.suffix else source.suffix
         candidate = source.with_name(f"{_COMPRESSED_MARKER}{source.stem}{target_suffix}")
         if await asyncio.to_thread(candidate.exists):
+            if await asyncio.to_thread(self._files_match_existing_compressed_output, candidate, temp_output):
+                log(
+                    f"Found existing compressed file {candidate.name}; removing duplicate output for {source.name}",
+                    20,
+                )
+                await self._delete_temp(temp_output)
+                await self._delete_original_after_promotion(source, candidate)
+                return candidate
+
             candidate = await asyncio.to_thread(self._next_available_marked_name, source, target_suffix)
             if candidate is None:
                 raise OSError(f"Unable to find a free [COMPRESSED] filename for {source}")
@@ -1702,6 +1732,42 @@ class CompressionManager:
             if not candidate.exists():
                 return candidate
         return None
+
+    def _files_match_existing_compressed_output(self, existing: Path, incoming: Path) -> bool:
+        try:
+            existing_size = existing.stat().st_size
+            incoming_size = incoming.stat().st_size
+            if existing_size <= 0 or existing_size != incoming_size:
+                return False
+
+            difference_limit = self._duplicate_output_difference_limit(existing_size)
+            differences = 0
+            with existing.open("rb") as existing_file, incoming.open("rb") as incoming_file:
+                while True:
+                    existing_chunk = existing_file.read(1024 * 1024)
+                    incoming_chunk = incoming_file.read(1024 * 1024)
+                    if not existing_chunk and not incoming_chunk:
+                        return True
+                    if existing_chunk == incoming_chunk:
+                        continue
+                    if difference_limit <= 0:
+                        return False
+                    differences += sum(
+                        existing_byte != incoming_byte
+                        for existing_byte, incoming_byte in zip(existing_chunk, incoming_chunk, strict=True)
+                    )
+                    if differences > difference_limit:
+                        return False
+        except (OSError, ValueError):
+            return False
+
+    def _duplicate_output_difference_limit(self, size: int) -> int:
+        if size < _DUPLICATE_OUTPUT_MIN_FUZZY_SIZE:
+            return 0
+        return min(
+            _DUPLICATE_OUTPUT_MAX_DIFFERING_BYTES,
+            max(1, int(size * _DUPLICATE_OUTPUT_MAX_DIFFERENCE_RATIO)),
+        )
 
     async def _replace_temp(self, temp_output: Path, source: Path) -> None:
         for attempt in range(10):
